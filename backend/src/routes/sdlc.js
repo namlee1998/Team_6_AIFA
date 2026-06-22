@@ -83,6 +83,9 @@ router.get('/dev/projects/:projectId/pending-approvals', authenticateDev, SdlcCo
 // Tool Approval
 router.post('/dev/tasks/:taskId/approve-tool', authenticateDev, SdlcController.approveToolCall.bind(SdlcController));
 
+// Open file
+router.post('/dev/projects/:projectId/open-file', authenticateDev, SdlcController.openFile.bind(SdlcController));
+
 // T5 - Hitl Routes
 router.post('/dev/tasks/:task_id/hitl', authenticateDev, SdlcController.submitHitlDecision.bind(SdlcController));
 

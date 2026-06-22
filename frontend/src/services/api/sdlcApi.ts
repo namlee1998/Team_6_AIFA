@@ -567,3 +567,6 @@ export const updateSystemSettings = (keys: Record<string, string>): Promise<{ st
   api.post(`${BASE}/dev/settings/env`, { keys }).then((r) => r.data);
 
 export const updateEnvSettings = updateSystemSettings;
+
+export const openFile = (projectId: string, path: string): Promise<void> =>
+  api.post(`${BASE}/dev/projects/${projectId}/open-file`, { path }).then((r) => r.data);

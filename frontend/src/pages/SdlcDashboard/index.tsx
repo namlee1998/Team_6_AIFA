@@ -5,13 +5,14 @@ import { useAppStore } from '@/store/useAppStore';
 import { useSearchParams } from 'react-router-dom';
 import {
   Check, Loader2, Clock, AlertCircle, SkipForward, PlayCircle,
-  User, Palette, Code, ShieldCheck, Bug, Plus, CheckCircle2
+  User, Palette, Code, ShieldCheck, Bug, Plus, CheckCircle2, FolderOpen
 } from 'lucide-react';
 import EmptyProjectState from './components/EmptyProjectState';
 import FeatureRequestChatbox from './components/FeatureRequestChatbox';
 import SessionCard from './components/SessionCard';
 import AgentOutputPanel from './components/AgentOutputPanel';
 import { Badge } from '@/components/ui/Badge';
+import { openFile } from '@/services/api/sdlcApi';
 
 const AGENT_TO_ROLE: Record<'PO' | 'UX' | 'DEV' | 'QA', string> = {
   PO: 'po-agent', UX: 'ux-agent', DEV: 'dev-agent', QA: 'qa-agent',
@@ -210,6 +211,26 @@ export default function SdlcDashboard() {
       )}
 
       <div className="flex flex-col gap-5">
+        {currentProjectId && localStorage.getItem(`repoUrl_${currentProjectId}`) && (
+          <div className="mx-[18px] flex items-center justify-between bg-surface-container/30 border border-outline-variant/30 rounded-lg p-3">
+            <div className="flex items-center gap-2 overflow-hidden">
+              <FolderOpen size={16} className="text-blue-400 shrink-0" />
+              <div className="flex flex-col">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-on-surface-variant/70">Project Repository</span>
+                <span className="text-xs font-mono text-on-surface-variant truncate">
+                  {localStorage.getItem(`repoUrl_${currentProjectId}`)}
+                </span>
+              </div>
+            </div>
+            <button
+              onClick={() => openFile(currentProjectId, '')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-400 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/20 rounded-md transition-colors shrink-0 cursor-pointer"
+            >
+              Open in IDE
+            </button>
+          </div>
+        )}
+
         {focusRequest && <FeatureRequestChatbox onClose={() => {
         searchParams.delete('focusRequest');
         setSearchParams(searchParams);

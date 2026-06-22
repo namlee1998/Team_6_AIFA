@@ -797,6 +797,32 @@ class SdlcController {
     } catch (err) { next(err); }
   }
 
+  async openFile(req, res, next) {
+    try {
+      const { projectId } = req.params;
+      const { path: relativePath } = req.body;
+      if (!projectId || relativePath === undefined) {
+        return res.status(400).json({ error: 'Missing projectId or path' });
+      }
+      const repoContext = await SdlcWorkflowService._getRepoContext(projectId);
+      if (!repoContext || !repoContext.repoPath) {
+        return res.status(404).json({ error: 'Repo path not found for project' });
+      }
+      const absPath = require('path').join(repoContext.repoPath, relativePath);
+      
+      // We will try opening the file using vscode URI which the OS handles
+      // Or we can just use child_process.exec to run 'code' or 'xdg-open'
+      // We try 'code' first since it's most common for VS Code users.
+      require('child_process').exec(`code -g "${absPath}"`, (err) => {
+        if (err) {
+          // fallback to standard open
+          require('child_process').exec(`xdg-open "${absPath}"`);
+        }
+      });
+      return res.json({ status: 'success', path: absPath });
+    } catch (err) { next(err); }
+  }
+
   async createBacklog(req, res, next) {
     try {
       const { project_id } = req.params;

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { X, Check, RefreshCw, AlertTriangle, Monitor, Layers, GitBranch, FileCode2, FileDiff, CheckCircle2, XCircle } from 'lucide-react';
-import { getSdlcTaskStatus, resolveOutputReviewGate, type GateItem } from '@/services/api/sdlcApi';
+import { X, Check, RefreshCw, AlertTriangle, Monitor, Layers, GitBranch, FileCode2, FileDiff, CheckCircle2, XCircle, ExternalLink } from 'lucide-react';
+import { getSdlcTaskStatus, resolveOutputReviewGate, openFile, type GateItem } from '@/services/api/sdlcApi';
 
 interface TaskArtifact {
   id: string;
@@ -295,12 +295,21 @@ function renderDiffLine(line: string, idx: number) {
   );
 }
 
-function DevDiffViewer({ devData }: { devData: DevArtifacts }) {
+function DevDiffViewer({ devData, projectId }: { devData: DevArtifacts; projectId?: string | null }) {
   const diff = devData.patch_diff || devData.mock_code_diff || '';
   const files = devData.changed_files || [];
   const buildOk = devData.build_result?.build_ok !== false;
   const testsRan = devData.build_result?.tests_ran === true;
   const riskLevel = devData.risk_classification?.level || 'LOW';
+
+  const handleOpenFile = async (file: string) => {
+    if (!projectId) return;
+    try {
+      await openFile(projectId, file);
+    } catch (e) {
+      console.error('Failed to open file:', e);
+    }
+  };
 
   return (
     <div className="flex flex-col gap-3">
@@ -334,9 +343,18 @@ function DevDiffViewer({ devData }: { devData: DevArtifacts }) {
           </div>
           <div className="flex flex-col gap-1">
             {files.map((f, i) => (
-              <div key={i} className="flex items-center gap-2 px-2 py-1 rounded-md bg-white/3 border border-white/6">
-                <span className="text-emerald-400 text-[9px] font-bold">M</span>
-                <span className="text-[9.5px] text-white/60 font-mono truncate">{f}</span>
+              <div key={i} className="flex items-center gap-2 px-2 py-1 rounded-md bg-white/3 border border-white/6 group hover:bg-white/5 transition-colors">
+                <span className="text-emerald-400 text-[9px] font-bold shrink-0">M</span>
+                <span className="text-[9.5px] text-white/60 font-mono truncate flex-1" title={f}>{f}</span>
+                {projectId && (
+                  <button 
+                    onClick={() => handleOpenFile(f)}
+                    className="opacity-0 group-hover:opacity-100 p-1 text-blue-400 hover:text-blue-300 transition-opacity bg-blue-500/10 rounded"
+                    title="Open in IDE"
+                  >
+                    <ExternalLink size={10} />
+                  </button>
+                )}
               </div>
             ))}
           </div>
@@ -391,6 +409,7 @@ export default function AgentOutputPanel({ agent, gate, taskId, onClose, onResol
   const [artifacts, setArtifacts] = useState<TaskArtifact[]>([]);
   const [uxData, setUxData] = useState<UxArtifacts | null>(null);
   const [devData, setDevData] = useState<DevArtifacts | null>(null);
+  const [projectId, setProjectId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reason, setReason] = useState('');
   const [showRejectForm, setShowRejectForm] = useState(false);
@@ -409,6 +428,7 @@ export default function AgentOutputPanel({ agent, gate, taskId, onClose, onResol
       .then((task) => {
         if (cancelled) return;
         setSummary(task?.result?.summary || gate?.payload.outputSummary || null);
+        if (task?.projectId) setProjectId(task.projectId);
         const arts: TaskArtifact[] = Array.isArray(task?.artifacts) ? task.artifacts : [];
         setArtifacts(arts);
 
@@ -576,7 +596,7 @@ export default function AgentOutputPanel({ agent, gate, taskId, onClose, onResol
                     <FileDiff size={11} className="text-amber-400" />
                     <span className="text-[9px] font-bold uppercase tracking-wider text-white/50">Code Changes</span>
                   </div>
-                  <DevDiffViewer devData={devData} />
+                  <DevDiffViewer devData={devData} projectId={projectId} />
                 </div>
               )}
 
