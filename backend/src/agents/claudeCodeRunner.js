@@ -370,6 +370,95 @@ function normalizeOutput(role, parsed, meta = {}) {
   return output;
 }
 
+// Per-role exact-shape guide for each required key. Claude often emits a
+// plausible prose paragraph where a typed string/array is expected, then the
+// contract validator rejects it (e.g. DEV `implementation_plan` arriving as a
+// single short sentence instead of a Markdown summary; `changed_files`
+// arriving as one string instead of an array). This block is appended to the
+// Runtime Contract so the agent sees the shape right above the fenced block.
+const KEY_SHAPE_GUIDE = {
+  'dev-agent': {
+    implementation_plan:
+      'Markdown string (>= 1 paragraph). MUST reference project_definition fields by name. ' +
+      'Summarize WHAT was changed and WHY. Acceptable: "# Implementation\\n\\nThe implementation uses the language/framework/runtime declared in project_definition. Edited src/App.jsx to add the login button…". Forbidden: a single sentence; restating tech-stack values verbatim (e.g. "- Language: JavaScript"); an empty string.',
+    patch_diff:
+      'Non-empty unified diff or patch summary. Acceptable formats: a unified diff starting with "diff --git a/... b/..." / "@@ ...", OR a per-file patch summary like "frontend/src/App.jsx\\n+ import LoginBtn\\n+ export default function App() {\\n+   return <LoginBtn />;\\n+ }". Forbidden: empty string, "no changes", "see implementation_plan".',
+    changed_files:
+      'JSON array of strings (paths relative to repo root) OR array of objects {path, summary?}. ' +
+      'Acceptable: ["frontend/src/App.jsx", "frontend/src/App.css"] OR [{path:"frontend/src/App.jsx", summary:"add login button"}]. ' +
+      'Forbidden: a single string (even with newlines); an empty array.',
+    linked_ac_ids: 'JSON array of AC-id strings (PO acceptance_criteria ids this patch covers). Optional; default to [].',
+  },
+  'qa-agent': {
+    test_cases: 'JSON array of {id, description, ac_covered[]} objects.',
+    qa_report: 'Markdown string summarizing QA outcome.',
+    ac_coverage_matrix: 'JSON array of {ac_id, covered:boolean, evidence} rows.',
+    test_run_report: 'JSON object or string summarizing the test run.',
+    release_reason: 'Non-empty string explaining release readiness.',
+    blocker_count: 'Non-negative integer.',
+    build_result: 'JSON object or string with build outcome.',
+    self_test_report: 'JSON object or string with self-test outcome.',
+    linked_ac_ids: 'JSON array of AC-id strings.',
+    risk_classification: 'JSON object with required_gates[] and levels.',
+    risk_assessment: 'Markdown or JSON string with risk analysis.',
+    security_notes: 'JSON array of strings or {id,note} objects.',
+    security_gate: 'JSON object describing the security gate decision.',
+  },
+  'po-agent': {
+    prd: 'Markdown string (>= 1 paragraph) summarising the product requirements.',
+    user_stories: 'JSON array of {id, role, want, so_that} objects.',
+    acceptance_criteria: 'JSON array of "AC-N: …" strings or {id, criterion} objects.',
+    scope: 'JSON array of in-scope items or a Markdown bullet list string.',
+    out_of_scope: 'JSON array of out-of-scope items or a Markdown bullet list string.',
+  },
+  'ux-agent': {
+    ux_spec: 'Markdown string describing the UX specification.',
+    user_flow: 'Markdown string or JSON object describing the user flow.',
+    wireframe_spec: 'Markdown string describing wireframes.',
+    screens: 'JSON array of {name, purpose, elements[]} objects (each element is a typed object, not a bare string).',
+    component_inventory: 'JSON array of component definitions or a comma-separated string.',
+    html_mockup: 'Non-empty HTML string.',
+  },
+  'architecture-agent': {
+    architecture_contract: 'JSON object with mandatory keys {project_type, language, framework, runtime, package_manager, build_system, deployment_target, repository, constraints, out_of_scope}. Each value MUST be wrapped as {value, source, status:"confirmed"}.',
+  },
+};
+
+function buildKeyShapeBlock(role, required) {
+  const guide = KEY_SHAPE_GUIDE[role];
+  if (!guide) return '(no shape guide available for this role)';
+  const lines = ['Each required key MUST conform to the shape below. The validator rejects any output that does not match.'];
+  for (const key of required) {
+    const shape = guide[key];
+    if (!shape) {
+      lines.push(`- \`${key}\`: non-empty (string / array / object as appropriate to the role).`);
+      continue;
+    }
+    lines.push(`- \`${key}\`: ${shape}`);
+  }
+  lines.push('');
+  lines.push('WRONG vs RIGHT (DEV, just so the shape is concrete):');
+  lines.push('');
+  lines.push('WRONG — `changed_files` as a single string:');
+  lines.push('```json');
+  lines.push('{ "changed_files": "frontend/src/App.jsx, frontend/src/App.css" }');
+  lines.push('```');
+  lines.push('RIGHT — `changed_files` as an array of strings:');
+  lines.push('```json');
+  lines.push('{ "changed_files": ["frontend/src/App.jsx", "frontend/src/App.css"] }');
+  lines.push('```');
+  lines.push('');
+  lines.push('WRONG — `implementation_plan` as one short sentence:');
+  lines.push('```json');
+  lines.push('{ "implementation_plan": "Added login button." }');
+  lines.push('```');
+  lines.push('RIGHT — `implementation_plan` as Markdown with project_definition reference:');
+  lines.push('```json');
+  lines.push('{ "implementation_plan": "# Implementation\\n\\nThe implementation uses the language, framework, and runtime declared in `project_definition`. Edited `frontend/src/App.jsx` to render a `<LoginBtn />` and `frontend/src/App.css` to style it per `color_palette`." }');
+  lines.push('```');
+  return lines.join('\n');
+}
+
 async function loadPromptTemplate(role) {
   const key = stageKey(role);
   try {
@@ -416,6 +505,9 @@ async function buildPrompt({ role, repoPath, context }) {
       rawSummary: 'Short human-readable summary',
     }, null, 2),
     '```',
+    '',
+    '### Required keys — exact shape per key',
+    buildKeyShapeBlock(role, required),
     '',
     '## Repository',
     repoPath ? `Working directory: ${repoPath}` : 'No repository was provided. Produce planning/evidence artifacts only.',
