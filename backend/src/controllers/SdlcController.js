@@ -67,18 +67,43 @@ class SdlcController {
   // ─── Run Agents ──────────────────────────────────────────────────────────
 
   /**
-   * PO is no longer reachable as a direct HTTP entry. Per AIFA v2.1 §3 / §7
-   * the canonical chain is ARCH → PO → UX → DEV → QA; PO must follow an
-   * approved Architecture task. The orchestrator starts PO automatically
-   * after the Architecture gate is approved, and rework flows route through
-   * the structured HITL endpoints.
+   * Deterministic PO happy-path entry. Architecture remains the pipeline entry:
+   * this endpoint accepts only an already-approved Architecture task and reuses
+   * that task's session repository. The explicit demo controls keep the normal
+   * production chain unchanged while allowing the PO stage to auto-approve and
+   * stop before UX after its local repository commit.
    */
   async runPOAgent(req, res, next) {
-    return res.status(410).json({
-      status: 'error',
-      code: 'PO_AGENT_ENTRY_REMOVED',
-      message: 'PO Agent is no longer a direct workflow entry. Per AIFA v2.1 §3/§7 the canonical chain starts with Architecture. Call POST /api/v1/sdlc/run-architecture-agent with repo_url, then approve the Architecture gate to auto-advance to PO.',
-    });
+    try {
+      const { project_id, source_task_id, feature_request } = req.body;
+      if (!project_id) {
+        return res.status(400).json({ status: 'error', message: 'project_id is required' });
+      }
+      if (!source_task_id) {
+        return res.status(400).json({ status: 'error', message: 'source_task_id is required' });
+      }
+      if (!feature_request || !feature_request.title) {
+        return res.status(400).json({ status: 'error', message: 'feature_request.title is required' });
+      }
+
+      const task = await SdlcWorkflowService.runPOAgent({
+        projectId: project_id,
+        sourceTaskId: source_task_id,
+        featureRequest: feature_request,
+        request: feature_request.title,
+        architectureInputPath: '.aifa/architecture_contract.json',
+        autoApproveOutputReview: true,
+        stopAfterAgent: 'po-agent',
+        user: req.user,
+      });
+
+      return res.status(202).json({
+        task_id: task.id,
+        session_id: task.sessionId,
+        status: task.status,
+        type: task.type,
+      });
+    } catch (err) { next(err); }
   }
 
   /**

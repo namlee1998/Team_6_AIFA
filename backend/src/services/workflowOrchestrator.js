@@ -4,6 +4,7 @@
 // service (SdlcWorkflowService) so that stateful methods stay in the class.
 
 const path = require('path');
+const fs = require('fs/promises');
 const { v4: uuidv4 } = require('uuid');
 const { Task, AgentArtifact, PipelineSession } = require('../models');
 const FeatureBacklog = require('../models/FeatureBacklog');
@@ -46,9 +47,33 @@ async function resolveStructuredArtifact(artifacts, artifactType, deps) {
   return null;
 }
 
-// =============================================================================
-// runArchitectureAgent
-// =============================================================================
+async function loadArchitectureInputFromRepo(session, inputPath) {
+  if (!session?.repoPath) {
+    throw new ApiError(400, 'Approved Architecture session has no repository workspace.', 'ARCHITECTURE_INPUT_MISSING', 'PO_RUNNING');
+  }
+  const relativePath = String(inputPath || '').trim();
+  if (!relativePath || path.isAbsolute(relativePath) || !repoService.isWithinRepo(session.repoPath, relativePath)) {
+    throw new ApiError(400, 'architectureInputPath must be a repository-relative path inside the session workspace.', 'ARCHITECTURE_INPUT_INVALID', 'PO_RUNNING');
+  }
+  const absolutePath = path.resolve(session.repoPath, relativePath);
+  let raw;
+  try {
+    raw = await fs.readFile(absolutePath, 'utf8');
+  } catch (error) {
+    throw new ApiError(400, `Architecture input not found at ${relativePath}: ${error.message}`, 'ARCHITECTURE_INPUT_MISSING', 'PO_RUNNING');
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new ApiError(422, `Architecture input is not valid JSON: ${error.message}`, 'ARCHITECTURE_INPUT_INVALID', 'PO_RUNNING');
+  }
+  if (!hasContent(parsed) || Array.isArray(parsed) || typeof parsed !== 'object') {
+    throw new ApiError(422, 'Architecture input must be a non-empty JSON object.', 'ARCHITECTURE_INPUT_INVALID', 'PO_RUNNING');
+  }
+  return parsed;
+}
+
 
 async function runArchitectureAgent(params, deps) {
   const { projectId, featureRequest, feedbackPrompt = '', backlogId = null, repoUrl = null, user } = params;
@@ -281,7 +306,8 @@ async function runPOAgent(params, deps) {
     projectId, sourceTaskId = null, featureRequest = null, feedbackPrompt = '',
     previousDraft = null, backlogId = null,
     repoUrl = null, repoPath = null, branch = 'main', request = '',
-    sessionId = null, user,
+    sessionId = null, architectureInputPath = null,
+    autoApproveOutputReview = false, stopAfterAgent = null, user,
   } = params;
   const sourceTask = sourceTaskId
     ? await deps.requireApprovedTask(sourceTaskId, 'architecture-agent', user)
@@ -336,9 +362,16 @@ async function runPOAgent(params, deps) {
   }
 
   const sourceArtifacts = sourceTask ? await AgentArtifact.findByTaskId(sourceTask.id) : [];
+  // The happy-path demo names the repository mirror explicitly. When present,
+  // it is the sole Architecture input: do not silently substitute a DB artifact.
+  // Resolve it before Task.create so malformed/missing input leaves no orphan PO task.
+  const architectureContract = architectureInputPath
+    ? await loadArchitectureInputFromRepo(session, architectureInputPath)
+    : await resolveStructuredArtifact(sourceArtifacts, 'architecture_contract', deps);
   const inputHash = deps.contentHash({
     featureRequest,
-    artifacts: sourceArtifacts.map((a) => a.contentHash),
+    architectureContract,
+    artifacts: architectureInputPath ? [] : sourceArtifacts.map((a) => a.contentHash),
     feedbackPrompt,
   });
 
@@ -356,6 +389,9 @@ async function runPOAgent(params, deps) {
   const poObservability = {};
   if (repoContext) poObservability.repo = repoContext;
   if (featureRequest) poObservability.featureRequest = featureRequest;
+  if (architectureInputPath) poObservability.architectureInputPath = architectureInputPath;
+  if (autoApproveOutputReview) poObservability.autoApproveOutputReview = true;
+  if (stopAfterAgent) poObservability.stopAfterAgent = stopAfterAgent;
   if (Object.keys(poObservability).length) {
     await Task.update(task.id, { observability: poObservability });
   }
@@ -368,13 +404,6 @@ async function runPOAgent(params, deps) {
       throw new ApiError(409, error.message);
     }
   }
-
-  // Phase 2: resolve the canonical `architecture_contract` artifact (alias of
-  // the former project_definition) from the ARCH task and inject it as a flat
-  // object into the PO context. PO's `compactContext` whitelist
-  // (claudeCodeRunner.js) carries the value into the AIFA Context as a
-  // structured object — no prompt change required.
-  const architectureContract = await resolveStructuredArtifact(sourceArtifacts, 'architecture_contract', deps);
 
   const context = await deps.buildContextFromArtifacts(sourceArtifacts, {
     feedbackPrompt,
