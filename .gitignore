@@ -32,6 +32,11 @@ __pycache__/
 # ---------------------------------------------------------------------------
 dist/
 build/
+coverage/
+out/
+.next/
+.nuxt/
+.turbo/
 frontend/.vite/
 **/.vite/
 *.tsbuildinfo
@@ -44,8 +49,14 @@ frontend/.vite/
 *.db
 backend/prisma/dev.db
 backend/prisma/*.db-journal
-workspace/projects/
+backend/prisma/*.db-wal
+backend/prisma/*.db-shm
+workspace/
 uploads/
+hook_target.txt
+tmp/
+temp/
+.cache/
 
 # ---------------------------------------------------------------------------
 # Logs
@@ -60,6 +71,7 @@ yarn-error.log*
 # IDE / editor / OS
 # ---------------------------------------------------------------------------
 .claude
+.omo/
 .stitch/
 .vscode/
 .idea/

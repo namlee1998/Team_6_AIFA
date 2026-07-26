@@ -1,4 +1,5 @@
 import type { TestcaseItem } from '@/services/api';
+import i18n from 'i18next';
 
 export interface ScenarioStep {
   id: string;
@@ -52,7 +53,7 @@ export interface Agent2InputSnapshot {
   flows: FlowSection[];
 }
 
-export function getScenarioData(tc: TestcaseItem): ScenarioData | null {
+function getScenarioData(tc: TestcaseItem): ScenarioData | null {
   if (!tc.scenarioData) return null;
   const d = tc.scenarioData as Record<string, unknown>;
   return {
@@ -114,7 +115,7 @@ export function buildTree(testcases: TestcaseItem[]): FeatureGroup[] {
 
   for (const tc of testcases) {
     const sd = getScenarioData(tc);
-    const featureName = sd?.feature_name || tc.featureName || 'Khác';
+    const featureName = sd?.feature_name || tc.featureName || i18n.t('common.other');
     const flowName = sd?.flow_name || tc.flowName || 'Unknown Flow';
 
     if (!map.has(featureName)) map.set(featureName, new Map());

@@ -1,447 +1,104 @@
+// Central SDLC orchestrator.
+//
+// Beginner reading guide:
+// 1. runPO/UX/DEV/QAAgent create stage tasks and assemble upstream context.
+// 2. _runAgent selects mock, Claude Agent SDK, or Python/LangChain execution.
+// 3. _saveAgentData persists output and validates gate-output.v4.
+// 4. _recordApprovedHandoff and _startNextAgentIfAvailable advance the chain.
+// 5. getWorkflowStatus derives the user-facing phase from persisted data.
+//
+// Keep transport logic in SdlcController and low-level lifecycle/gate mechanics
+// in taskLifecycleService, taskWorkerService, and gateBridge.
+
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
-const { Task, AgentArtifact, HitlDecision } = require('../models');
+const { Task, AgentArtifact, HitlDecision, AgentEvent, PipelineSession } = require('../models');
+const taskLifecycle = require('./taskLifecycleService');
+const taskWorker = require('./taskWorkerService');
 const FeatureBacklog = require('../models/FeatureBacklog');
 const AgentService = require('./AgentService');
-const MembershipService = require('./MembershipService');
-const QuotaService = require('./QuotaService');
+const MembershipService = {
+  requireProjectRole: async () => ({ role: 'owner' }),
+  listAccessibleProjectIds: async () => [],
+  getUserProjectRole: async () => 'owner',
+  createOwnerMembership: async () => { },
+};
+const QuotaService = {
+  getOrProvisionSubscription: async () => ({ planId: 'free', creditsUsed: 0, creditsTotal: 1000000 }),
+  recordUsage: async () => { },
+  recordFailedUsage: async () => { },
+  checkQuota: async () => true,
+};
 const QualityGateService = require('./QualityGateService');
 const fs = require('fs/promises');
 const path = require('path');
 const { ApiError, ERROR_CODES } = require('../middleware/errorHandler');
 const { assertOutputConforms } = require('./agentContract');
+const repoService = require('./repoService');
+const gateBridge = require('./gateBridge');
+const { qaGatePassed } = require('./qaGate');
+const { publishEvent } = require('./eventPublisher');
+const claudeCodeRunner = require('../agents/claudeCodeRunner');
+const codexRunner = require('../agents/codexRunner');
+const claudePermissionDispatcher = require('../agents/claudePermissionDispatcher');
+const workflowReport = require('./workflowReport');
+const workflowQueries = require('./workflowQueries');
+const { contentHash, buildTaskResult, resolveArtifactContent, formatArtifactForClient } = workflowQueries;
+const artifactManager = require('./artifactManager');
+const gateManager = require('./gateManager');
+const workflowHelpers = require('./workflowHelpers');
+const releaseManager = require('./releaseManager');
+const agentDispatcher = require('./agentDispatcher');
+const workflowOrchestrator = require('./workflowOrchestrator');
+const {
+  resolveMockScenario, applyScenarioNarrative,
+  classifyFeatureRequest, firstContextValue, normalizeStructuredFeedback,
+  validateStructuredFeedback, applyJsonPatch, applyMockScenario,
+} = workflowHelpers;
 const logger = require('../config/logger');
 
-const WORKSPACE_DIR = path.join(__dirname, '../../../workspace/projects');
-
 // ---------------------------------------------------------------------------
-// Workflow State Machine
-// States: DRAFT → PO_RUNNING → PO_REVIEW → UX_RUNNING → UX_REVIEW →
-//         DEV_RUNNING → DEV_REVIEW → QA_RUNNING → QA_REVIEW →
-//         FINAL_REVIEW → READY / HOLD
-// Rework states: PO_REWORK | UX_REWORK | DEV_REWORK | QA_FAILED
+// sdlcConstants: single source of truth for all workflow constants
 // ---------------------------------------------------------------------------
+const {
+  WORKSPACE_DIR, AGENT_GATES, OUTPUT_REVIEW_GATE_TYPE, CLARIFY_GATE_TYPE, NEXT_AGENT, NODE_TARGET,
+  REWORK_TARGETS, GATE_MODE, DEFAULT_GATE_MODE, REVIEW_HOLDS, GATE_CONFIG,
+  AUTO_APPROVE_CONFIDENCE, OUTPUT_CONTRACT_VERSION, OUTPUT_CONTRACTS,
+  MAX_RETRY_PER_STEP, RETRY_REASONS, AGENT_POLICY, FINAL_GATE, RELEASE_DECISIONS,
+  MOCK_REVIEW_STAGES, DEFAULT_MOCK_SCENARIO, VAGUE_REVIEW_COMMENTS,
+  MOCK_SCENARIO_PROFILES,
+  // OBS-01.10 R-25: extracted from inline closure so the canonical
+  // executionStatus → PhaseStatus mapping is unit-testable.
+  toPhaseStatus,
+} = require('./sdlcConstants');
 
-const AGENT_GATES = {
-  'intent-agent': 'REQUIREMENT_GATE',
-  'po-agent':  'REQUIREMENT_GATE',
-  'ux-agent':  'UX_GATE',
-  'dev-agent': 'DEV_GATE',
-  'qa-agent':  'QA_GATE',
-};
+// Hot in-memory cache for onGate audit entries. New entries are also persisted
+// as AgentEvent; this cache mainly supports the current process efficiently.
+const GATE_AUDIT = new Map();
 
-const NEXT_AGENT = {
-  'intent-agent': 'po-agent',
-  'po-agent':  'ux-agent',
-  'ux-agent':  'dev-agent',
-  'dev-agent': 'qa-agent',
-  'qa-agent':  null,          // → FINAL_REVIEW
-};
-
-const NODE_TARGET = {
-  'intent-agent': 'intent_node',
-  'po-agent':  'po_agent',
-  'ux-agent':  'ux_agent',
-  'dev-agent': 'dev_agent',
-  'qa-agent':  'qa_agent',
-};
-
-const REWORK_TARGETS = {
-  po_agent:  { sourceType: 'intent-agent', run: 'runPOAgent' },
-  ux_agent:  { sourceType: 'po-agent',     run: 'runUXAgent' },
-  dev_agent: { sourceType: 'ux-agent',     run: 'runDEVAgent' },
-  qa_agent:  { sourceType: 'dev-agent',    run: 'runQAAgent' },
-};
-
-// ---------------------------------------------------------------------------
-// Structured HITL (plan section 2): Gate Mode, retry policy, JSON Patch
-// ---------------------------------------------------------------------------
-const GATE_MODE = {
-  STRICT_MANUAL: 'strict_manual',     // always require a human approve
-  CONFIDENCE: 'confidence_based',     // pause only on low confidence / warnings
-  AUTO_SAFE: 'auto_approve_safe',     // auto-approve when validation passes AND risk low
-};
-
-// Default policy per gate. QA gate (release decision) stays strict_manual.
-const DEFAULT_GATE_MODE = {
-  'intent-agent': GATE_MODE.STRICT_MANUAL,
-  'po-agent':  GATE_MODE.CONFIDENCE,
-  'ux-agent':  GATE_MODE.CONFIDENCE,
-  'dev-agent': GATE_MODE.CONFIDENCE,
-  'qa-agent':  GATE_MODE.STRICT_MANUAL,
-};
-
-// ---------------------------------------------------------------------------
-// Gate configuration (T2) — single, documented place for the HITL gate knobs.
-// IMPORTANT: do NOT lower AUTO_APPROVE_CONFIDENCE. Existing behaviour/tests
-// depend on the 0.8 threshold; the demo bad-cases are tuned against it.
-// ---------------------------------------------------------------------------
-const GATE_CONFIG = {
-  // Outputs at or above this confidence may auto-approve; below → HOLD (human).
-  AUTO_APPROVE_CONFIDENCE: 0.8,
-  // Validation severity that blocks a handoff and marks the artifact INVALID.
-  BLOCKING_SEVERITY: 'BLOCKER',
-  // Evidence severities that lock the Final Release gate (QA blocker etc.).
-  RELEASE_BLOCKING_SEVERITIES: ['BLOCKER', 'CRITICAL', 'HIGH'],
-};
-
-const AUTO_APPROVE_CONFIDENCE = GATE_CONFIG.AUTO_APPROVE_CONFIDENCE;
-
-// ---------------------------------------------------------------------------
-// Agent output contracts (I5) — the single, explicit, *versioned* source of
-// truth for "what each role must produce". `_validateGateOutput` iterates these
-// rules instead of hand-inlining them, so the handoff contract is visible in
-// one place and a drift test (tests/integration/output-contract.test.js) fails
-// if the shape changes without bumping OUTPUT_CONTRACT_VERSION.
-//
-// Each rule: { rule, severity, check(out, task) -> bool, detail(out)|string,
-//              when?(out) -> bool }  (no Ajv — predicates stay hand-written).
-// ---------------------------------------------------------------------------
-const OUTPUT_CONTRACT_VERSION = 'gate-output.v1';
-
-const _acList = (o) => (Array.isArray(o.acceptance_criteria) ? o.acceptance_criteria : []);
-const _matrix = (o) => (Array.isArray(o.ac_coverage_matrix) ? o.ac_coverage_matrix : []);
-
-const PO_RULES = [
-  { rule: 'prd_present', severity: 'BLOCKER', detail: 'PRD is empty',
-    check: (o) => typeof o.prd === 'string' && o.prd.trim().length > 0 },
-  { rule: 'ac_present', severity: 'BLOCKER', detail: 'No acceptance criteria',
-    check: (o) => _acList(o).length > 0 },
-  { rule: 'ac_measurable', severity: 'WARNING',
-    detail: (o) => `${_acList(o).filter((a) => String(a).trim().length < 12).length} acceptance criteria look too vague to test`,
-    check: (o) => _acList(o).every((a) => String(a).trim().length >= 12) },
-];
-
-const OUTPUT_CONTRACTS = {
-  version: OUTPUT_CONTRACT_VERSION,
-  'intent-agent': PO_RULES,
-  'po-agent': PO_RULES,
-  'ux-agent': [
-    { rule: 'ux_spec_present', severity: 'BLOCKER', detail: 'UX spec is empty',
-      check: (o) => typeof o.ux_spec === 'string' && o.ux_spec.trim().length > 0 },
-    { rule: 'screens_present', severity: 'BLOCKER', detail: 'No screens or wireframes',
-      check: (o) => !!((o.screens && o.screens.length) || (o.wireframe_spec || '').trim()) },
-  ],
-  'dev-agent': [
-    { rule: 'patch_present', severity: 'BLOCKER', detail: 'No code patch produced',
-      check: (o) => (o.patch_diff || o.mock_code_diff || '').trim().length > 0 },
-    { rule: 'patch_format', severity: 'WARNING', detail: 'patch_format is not defined',
-      check: (o) => !!o.patch_format },
-    { rule: 'build_ok', severity: 'BLOCKER', detail: 'Sandbox build did not pass',
-      check: (o) => (o.sandbox_result || {}).build_ok !== false },
-    { rule: 'sandbox_tests', severity: 'BLOCKER', detail: 'Sandbox test execution evidence is missing',
-      check: (o) => (o.sandbox_result || {}).tests_ran === true },
-    { rule: 'self_test_report', severity: 'BLOCKER', detail: 'DEV self-test report is missing',
-      check: (o) => !!o.self_test_report },
-    { rule: 'linked_ac', severity: 'WARNING', detail: 'Patch is not linked to any AC',
-      check: (o) => Array.isArray(o.linked_ac_ids) && o.linked_ac_ids.length > 0 },
-    { rule: 'security_notes', severity: 'BLOCKER', detail: 'High-risk DEV output is missing security notes',
-      when: (o) => !!o.risk_classification?.required_gates?.includes('security'),
-      check: (o) => !!o.security_notes },
-    { rule: 'security_gate', severity: 'BLOCKER', detail: 'Security gate must PASS before DEV handoff',
-      when: (o) => !!o.risk_classification?.required_gates?.includes('security'),
-      check: (o) => o.security_gate?.recommendation === 'PASS' },
-  ],
-  'qa-agent': [
-    { rule: 'coverage_present', severity: 'BLOCKER', detail: 'No AC coverage matrix',
-      check: (o) => _matrix(o).length > 0 },
-    { rule: 'coverage_complete', severity: 'BLOCKER',
-      detail: (o) => `${_matrix(o).filter((r) => r.covered !== true).length} acceptance criteria are not covered`,
-      check: (o) => _matrix(o).every((r) => r.covered === true) },
-    { rule: 'tests_executed', severity: 'BLOCKER', detail: 'Tests were not actually executed',
-      check: (o) => (o.test_run_report || {}).executed === true },
-    { rule: 'tests_passed', severity: 'BLOCKER',
-      detail: (o) => `${(o.test_run_report || {}).failed || 0} test(s) failed`,
-      check: (o) => ((o.test_run_report || {}).failed || 0) === 0 },
-    { rule: 'no_blockers', severity: 'BLOCKER',
-      detail: (o) => `${o.blocker_count || 0} blocker(s) present`,
-      check: (o) => (o.blocker_count || 0) === 0 },
-    { rule: 'release_reason', severity: 'WARNING', detail: 'Release decision has no justification',
-      check: (o) => !!(o.release_reason && o.release_reason.trim()) },
-    { rule: 'quality_gate_pass', severity: 'BLOCKER',
-      detail: (o, task) => `Quality gate is ${(task?.result?.gateRecommendation) || o.gate_evaluation?.recommendation || 'unknown'}, expected PASS`,
-      check: (o, task) => ((task?.result?.gateRecommendation) || o.gate_evaluation?.recommendation) === 'PASS' },
-  ],
-};
-
-const MAX_RETRY_PER_STEP = 3;
-const RETRY_REASONS = ['schema_invalid', 'ac_not_measurable', 'coverage_gap', 'build_fail', 'quality_low', 'other'];
-
-// Timeout / retry budget per agent (plan TIP-010). In mock mode timeouts are
-// not enforced (the mock runner always resolves), but the budget is published
-// so the orchestrator state machine, audit trail, and UI can reason about it.
-const AGENT_POLICY = {
-  'po-agent':  { max_attempts: MAX_RETRY_PER_STEP, timeout_seconds: 180 },
-  'ux-agent':  { max_attempts: MAX_RETRY_PER_STEP, timeout_seconds: 240 },
-  'dev-agent': { max_attempts: MAX_RETRY_PER_STEP, timeout_seconds: 600 },
-  'qa-agent':  { max_attempts: 2,                  timeout_seconds: 600 },
-};
-const FINAL_GATE = 'FINAL_GATE';
-const RELEASE_DECISIONS = ['APPROVE', 'REJECT'];
-const MOCK_REVIEW_STAGES = ['po-agent', 'ux-agent', 'dev-agent'];
-// T3: deterministic demo scenarios, selected via env `MOCK_SCENARIO`.
-const MOCK_SCENARIOS = ['happy_path', 'low_confidence_hold', 'missing_evidence', 'qa_blocker', 'release_reject', 'escalation'];
-const DEFAULT_MOCK_SCENARIO = 'happy_path';
-const VAGUE_REVIEW_COMMENTS = new Set(['rework', 'fix', 'bad', 'wrong', 'redo', 'do again', 'lam lai', 'sua lai']);
-
-const MOCK_SCENARIO_PROFILES = {
-  happy_path: {
-    title: 'Happy path release',
-    outcome: 'All worker gates pass and the final release can be approved.',
-    signals: ['high confidence', 'complete evidence', 'QA pass'],
-  },
-  low_confidence_hold: {
-    title: 'Low confidence hold',
-    outcome: 'The configured review stage finishes with low confidence and waits for HITL review.',
-    signals: ['confidence 0.58', 'manual review required', 'no auto-commit'],
-  },
-  missing_evidence: {
-    title: 'Missing DEV evidence',
-    outcome: 'DEV omits sandbox execution evidence, artifacts become INVALID, and QA handoff is blocked.',
-    signals: ['sandbox tests not run', 'self test report missing', 'DEV INVALID'],
-  },
-  qa_blocker: {
-    title: 'QA blocker',
-    outcome: 'QA finds a blocking regression and the release gate stays locked.',
-    signals: ['blocker count 2', 'failed test present', 'release not eligible'],
-  },
-  release_reject: {
-    title: 'Final release reject',
-    outcome: 'All agents pass, then the final human release decision rejects the packet.',
-    signals: ['QA pass', 'release packet ready', 'final gate rejects'],
-  },
-  escalation: {
-    title: 'Max retry escalation',
-    outcome: 'The target review stage remains low confidence after rework and escalates after retry budget.',
-    signals: ['confidence stays 0.58', 'rework cannot recover', 'escalation_required'],
-  },
-};
-
-function resolveMockScenario() {
-  const rawScenario = (process.env.MOCK_SCENARIO || '').toLowerCase();
-  return MOCK_SCENARIOS.includes(rawScenario) ? rawScenario : DEFAULT_MOCK_SCENARIO;
-}
-
-function buildScenarioBrief(scenario, task) {
-  const profile = MOCK_SCENARIO_PROFILES[scenario] || MOCK_SCENARIO_PROFILES[DEFAULT_MOCK_SCENARIO];
-  return {
-    scenario,
-    title: profile.title,
-    stage: task.type,
-    expected_outcome: profile.outcome,
-    demo_signals: profile.signals,
-  };
-}
-
-function applyScenarioNarrative(task, completedData, scenario, feedbackPrompt) {
-  const profile = MOCK_SCENARIO_PROFILES[scenario] || MOCK_SCENARIO_PROFILES[DEFAULT_MOCK_SCENARIO];
-  const stage = task.type.replace('-agent', '').toUpperCase();
-  completedData.summary = `${profile.title}: ${stage} mock output prepared for the demo branch.`;
-  completedData.scenario_brief = buildScenarioBrief(scenario, task);
-  completedData.observability = {
-    ...(completedData.observability || {}),
-    trace_id: `mock-${scenario}-${task.type}`,
-    scenario,
-    feedback_received: Boolean(feedbackPrompt),
-  };
-
-  if (task.type === 'po-agent') {
-    completedData.prd = `# ${profile.title}\n\nScenario intent: ${profile.outcome}\n\n${completedData.prd || ''}`;
-    completedData.scope = `${completedData.scope || ''}\n\nDemo branch: ${profile.title}. Signals: ${profile.signals.join(', ')}.`;
+/**
+ * Convert a clarification answer blob (either an object {question: answer, …}
+ * or an array of strings) into a short feedback string the owning agent will
+ * see on its re-run prompt. Used by the question gate's resolveApproval path.
+ */
+function formatAnswersForFeedback(answers) {
+  if (!answers) return '';
+  if (typeof answers === 'string') return answers;
+  if (Array.isArray(answers)) {
+    return answers.map((a, i) => `${i + 1}. ${typeof a === 'object' ? JSON.stringify(a) : String(a)}`).join('\n');
   }
-
-  if (task.type === 'ux-agent') {
-    completedData.ux_spec = `# ${profile.title}\n\nUX focus for this branch: ${profile.outcome}\n\n${completedData.ux_spec || ''}`;
-    if (Array.isArray(completedData.screens)) {
-      completedData.screens = completedData.screens.map((screen) => ({
-        ...screen,
-        demo_scenario: scenario,
-        demo_signal: profile.signals[0],
-      }));
-    }
+  if (typeof answers === 'object') {
+    return Object.entries(answers)
+      .map(([q, a]) => `Q: ${q}\nA: ${typeof a === 'object' ? JSON.stringify(a) : String(a)}`)
+      .join('\n\n');
   }
-
-  if (task.type === 'dev-agent') {
-    completedData.implementation_plan = `# ${profile.title}\n\nImplementation evidence expected: ${profile.signals.join(', ')}.\n\n${completedData.implementation_plan || ''}`;
-    completedData.sandbox_report = `${completedData.sandbox_report || ''}\n\nDemo branch: ${profile.title}. Expected outcome: ${profile.outcome}`;
-  }
-
-  if (task.type === 'qa-agent') {
-    completedData.qa_report = `# ${profile.title}\n\nQA branch result: ${profile.outcome}\n\n${completedData.qa_report || ''}`;
-    completedData.release_reason = `${profile.title}: ${profile.outcome}`;
-  }
+  return String(answers);
 }
 
-function classifyFeatureRequest(featureRequest = {}) {
-  const text = `${featureRequest.title || ''} ${featureRequest.description || ''}`.toLowerCase();
-  const rules = [
-    { tag: 'auth', keywords: ['login', 'signin', 'sign in', 'oauth', 'authentication', 'dang nhap'] },
-    { tag: 'payment', keywords: ['payment', 'checkout', 'billing', 'refund', 'stripe'] },
-    { tag: 'pii', keywords: ['profile', 'email', 'phone', 'address', 'personal data'] },
-    { tag: 'admin', keywords: ['admin', 'permission', 'role', 'rbac'] },
-  ];
-  const riskTags = rules.filter((rule) => rule.keywords.some((keyword) => text.includes(keyword))).map((rule) => rule.tag);
-  const isHighRisk = riskTags.some((tag) => ['auth', 'payment', 'pii', 'admin'].includes(tag));
-  if (riskTags.includes('auth')) riskTags.push('oauth', 'session');
-  return {
-    level: isHighRisk ? 'HIGH' : 'LOW',
-    tags: [...new Set(riskTags)],
-    required_gates: isHighRisk ? ['schema', 'validation', 'evidence', 'security', 'qa'] : ['schema', 'validation', 'evidence', 'qa'],
-    classifier: 'mock-rule-based.v1',
-    reason: isHighRisk
-      ? 'Sensitive feature keywords require evidence-based review and a security checklist.'
-      : 'No sensitive feature keyword was detected by the mock classifier.',
-  };
-}
-
-function firstContextValue(context, key) {
-  const item = Array.isArray(context?.[key]) ? context[key][0] : null;
-  return item?.content ?? null;
-}
-
-function normalizeStructuredFeedback(payload = {}, comment = '') {
-  return {
-    decision: 'reject_and_rerun',
-    comment: String(comment || '').trim(),
-    target_fields: Array.isArray(payload.target_fields) ? payload.target_fields.filter(Boolean) : [],
-    blocking_issues: Array.isArray(payload.blocking_issues)
-      ? payload.blocking_issues.map((issue) => ({
-        severity: issue.severity || 'HIGH',
-        issue: String(issue.issue || '').trim(),
-        expected_fix: String(issue.expected_fix || '').trim(),
-      })).filter((issue) => issue.issue || issue.expected_fix)
-      : [],
-    acceptance_checks: Array.isArray(payload.acceptance_checks) ? payload.acceptance_checks.filter(Boolean) : [],
-    rerun_scope: 'same_agent_only',
-  };
-}
-
-function validateStructuredFeedback(feedback) {
-  if (feedback.comment.length < 10 || VAGUE_REVIEW_COMMENTS.has(feedback.comment.toLowerCase())) {
-    throw new ApiError(422, 'Reviewer feedback must explain the requested direction in at least 10 characters.');
-  }
-  if (!feedback.blocking_issues.length || feedback.blocking_issues.some((issue) => !issue.issue || !issue.expected_fix)) {
-    throw new ApiError(422, 'Add at least one blocking issue and the expected fix before rerunning the worker.');
-  }
-  if (!feedback.acceptance_checks.length) {
-    throw new ApiError(422, 'Add at least one acceptance check so the rerun can be verified.');
-  }
-}
-
-/** Resolve an RFC 6902 JSON Pointer to its parent container + final key. */
-function _resolvePointer(doc, pointer) {
-  if (pointer === '') return { parent: null, key: null, target: doc };
-  const parts = pointer.split('/').slice(1).map((p) => p.replace(/~1/g, '/').replace(/~0/g, '~'));
-  let parent = doc;
-  for (let i = 0; i < parts.length - 1; i += 1) {
-    const key = Array.isArray(parent) ? Number(parts[i]) : parts[i];
-    if (parent[key] === undefined) parent[key] = {};
-    parent = parent[key];
-  }
-  const lastRaw = parts[parts.length - 1];
-  const key = Array.isArray(parent) ? (lastRaw === '-' ? parent.length : Number(lastRaw)) : lastRaw;
-  return { parent, key };
-}
-
-/** Minimal RFC 6902 JSON Patch applier (add / replace / remove). Returns a new doc. */
-function applyJsonPatch(source, operations = []) {
-  const doc = JSON.parse(JSON.stringify(source || {}));
-  for (const op of operations) {
-    if (!op || typeof op.path !== 'string') continue;
-    const { parent, key } = _resolvePointer(doc, op.path);
-    if (parent === null) continue; // replacing whole doc unsupported here
-    if (op.op === 'add' || op.op === 'replace') {
-      if (Array.isArray(parent) && op.op === 'add') parent.splice(key, 0, op.value);
-      else parent[key] = op.value;
-    } else if (op.op === 'remove') {
-      if (Array.isArray(parent)) parent.splice(key, 1);
-      else delete parent[key];
-    }
-  }
-  return doc;
-}
-
-/** SHA-256 content hash */
-function contentHash(value) {
-  const json = typeof value === 'string' ? value : JSON.stringify(value);
-  return crypto.createHash('sha256').update(json, 'utf8').digest('hex');
-}
-
-/** Build task result from artifacts for client consumption */
-function buildTaskResult(task, artifacts = []) {
-  const byType = {};
-  for (const art of artifacts) {
-    const artifactType = art.artifactType || art.type;
-    if (!byType[artifactType]) byType[artifactType] = [];
-    byType[artifactType].push(art);
-  }
-
-  return {
-    agentType: task.type,
-    artifacts: artifacts.map((a) => ({
-      id: a.id,
-      phase: a.phase || a.agentType,
-      type: a.type || a.artifactType,
-      key: a.key || a.artifactKey,
-      title: a.title,
-      contentText: a.contentText,
-      contentJson: a.contentJson,
-    })),
-    ...task.result,
-  };
-}
-
-async function resolveArtifactContent(artifact) {
-  let contentText = artifact.contentText;
-  let contentJson = artifact.contentJson;
-
-  if (typeof contentText === 'string' && contentText.startsWith('FILE:')) {
-    try {
-      contentText = await fs.readFile(contentText.slice(5), 'utf8');
-    } catch (_) {
-      contentText = 'File not found';
-    }
-  }
-
-  if (!contentText && contentJson?.file_path) {
-    try {
-      const raw = await fs.readFile(contentJson.file_path, 'utf8');
-      try {
-        contentJson = JSON.parse(raw);
-      } catch (_) {
-        contentText = raw;
-        contentJson = null;
-      }
-    } catch (_) {
-      contentText = 'File not found';
-    }
-  }
-
-  return { contentText, contentJson };
-}
-
-async function formatArtifactForClient(artifact) {
-  const { contentText, contentJson } = await resolveArtifactContent(artifact);
-  return {
-    id: artifact.id,
-    taskId: artifact.taskId,
-    projectId: artifact.projectId,
-    phase: artifact.agentType,
-    agentType: artifact.agentType,
-    type: artifact.artifactType,
-    artifactType: artifact.artifactType,
-    key: artifact.artifactKey,
-    artifactKey: artifact.artifactKey,
-    title: artifact.title,
-    contentText,
-    contentJson,
-    ordinal: artifact.ordinal,
-    sourceArtifactId: artifact.sourceArtifactId,
-    contentHash: artifact.contentHash,
-    createdAt: artifact.createdAt,
-    updatedAt: artifact.updatedAt,
-  };
-}
+// Execution adapter and concurrency switches. Non-Claude execution remains the
+// default for backward-compatible local environments.
+const EXECUTION_PATH = () => (process.env.EXECUTION_PATH || 'langchain');
+const MAX_PARALLEL_WORKFLOWS = () => Math.max(1, Number(process.env.MAX_PARALLEL_WORKFLOWS) || 4);
 
 class SdlcWorkflowService {
   // =========================================================================
@@ -449,191 +106,76 @@ class SdlcWorkflowService {
   // =========================================================================
 
   /**
-   * Start an Intent Agent run — generates AI assumptions from raw request.
+   * Start an Architecture Agent run — generates architecture brief from raw request + repo.
    */
-  async runIntentAgent({ projectId, featureRequest, feedbackPrompt = '', backlogId = null, user }) {
-    if (user) {
-      await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor']);
-    }
-
-    const inputHash = contentHash({ featureRequest, feedbackPrompt });
-    const task = await Task.create({
-      id: uuidv4(),
-      projectId,
-      type: 'intent-agent',
-      status: 'pending',
-      inputContentHash: inputHash,
-      versionStatus: 'draft',
-    });
-
-    if (backlogId) {
-      try {
-        await FeatureBacklog.linkTask(backlogId, task.id, projectId);
-      } catch (error) {
-        await Task.deleteById(task.id);
-        throw new ApiError(409, error.message);
-      }
-    }
-
-    this._runAgent(task, {
-      featureRequest,
-      feedbackPrompt,
-    }, user?.id).catch((err) => console.error('[SDLC] Intent Agent failed:', err));
-
-    return task;
+  async runArchitectureAgent({ projectId, featureRequest, feedbackPrompt = '', backlogId = null, repoUrl = null, user }) {
+    const deps = {
+      MembershipService,
+      contentHash,
+      repoService,
+      runAgent: (t, ctx, uid) => this._runAgent(t, ctx, uid),
+    };
+    return workflowOrchestrator.runArchitectureAgent({ projectId, featureRequest, feedbackPrompt, backlogId, repoUrl, user }, deps);
   }
 
   /**
    * Start a PO Agent run — reads intent assumptions, produces PRD artifacts.
    */
-  async runPOAgent({ projectId, sourceTaskId = null, featureRequest = null, feedbackPrompt = '', backlogId = null, user }) {
-    const sourceTask = sourceTaskId
-      ? await this._requireApprovedTask(sourceTaskId, 'intent-agent', user)
-      : null;
-    const effectiveProjectId = projectId || sourceTask?.projectId;
-    if (!effectiveProjectId) throw new ApiError(400, 'projectId is required');
-    if (user) {
-      await MembershipService.requireProjectRole(user.id, effectiveProjectId, ['owner', 'admin', 'editor']);
-    }
-
-    const sourceArtifacts = sourceTask ? await AgentArtifact.findByTaskId(sourceTask.id) : [];
-    const inputHash = contentHash({
-      featureRequest,
-      artifacts: sourceArtifacts.map((a) => a.contentHash),
-      feedbackPrompt,
-    });
-
-    const task = await Task.create({
-      id: uuidv4(),
-      projectId: effectiveProjectId,
-      type: 'po-agent',
-      status: 'pending',
-      inputContentHash: inputHash,
-      sourceRunId: sourceTask?.id || null,
-      versionStatus: 'draft',
-    });
-
-    if (backlogId) {
-      try {
-        await FeatureBacklog.linkTask(backlogId, task.id, effectiveProjectId);
-      } catch (error) {
-        await Task.deleteById(task.id);
-        throw new ApiError(409, error.message);
-      }
-    }
-
-    const context = await this._buildContextFromArtifacts(sourceArtifacts, {
-      feedbackPrompt,
-      ...(featureRequest ? { featureRequest } : {}),
-    });
-
-    this._runAgent(task, context, user?.id).catch((err) => console.error('[SDLC] PO Agent failed:', err));
-
-    return task;
+  async runPOAgent({ projectId, sourceTaskId = null, featureRequest = null, feedbackPrompt = '', previousDraft = null, backlogId = null,
+    repoUrl = null, repoPath = null, branch = 'main', request = '', sessionId = null, user }) {
+    const deps = {
+      MembershipService,
+      contentHash,
+      runAgent: (t, ctx, uid) => this._runAgent(t, ctx, uid),
+      requireApprovedTask: (tid, type, u) => this._requireApprovedTask(tid, type, u),
+      buildContextFromArtifacts: (arts, extras) => this._buildContextFromArtifacts(arts, extras),
+    };
+    return workflowOrchestrator.runPOAgent({
+      projectId, sourceTaskId, featureRequest, feedbackPrompt, previousDraft, backlogId,
+      repoUrl, repoPath, branch, request, sessionId, user,
+    }, deps);
   }
 
   /**
    * Start a UX Agent run — reads approved PRD artifacts, produces UX spec.
    */
-  async runUXAgent({ projectId, sourceTaskId, feedbackPrompt = '', user }) {
-    const sourceTask = await this._requireApprovedTask(sourceTaskId, 'po-agent', user);
-
-    const sourceArtifacts = await AgentArtifact.findByTaskId(sourceTask.id);
-    const inputHash = contentHash({
-      artifacts: sourceArtifacts.map((a) => a.contentHash),
-      feedbackPrompt,
-    });
-
-    const task = await Task.create({
-      id: uuidv4(),
-      projectId: sourceTask.projectId,
-      type: 'ux-agent',
-      status: 'pending',
-      inputContentHash: inputHash,
-      sourceRunId: sourceTask.id,
-      versionStatus: 'draft',
-    });
-
-    const context = await this._buildContextFromArtifacts(sourceArtifacts, { feedbackPrompt });
-    this._runAgent(task, context, user?.id).catch((err) => console.error('[SDLC] UX Agent failed:', err));
-
-    return task;
+  async runUXAgent({ projectId, sourceTaskId, feedbackPrompt = '', previousDraft = null, user }) {
+    const deps = {
+      contentHash,
+      runAgent: (t, ctx, uid) => this._runAgent(t, ctx, uid),
+      requireApprovedTask: (tid, type, u) => this._requireApprovedTask(tid, type, u),
+      buildContextFromArtifacts: (arts, extras) => this._buildContextFromArtifacts(arts, extras),
+      getRepoContext: (pid, sid) => this._getRepoContext(pid, sid),
+    };
+    return workflowOrchestrator.runUXAgent({ projectId, sourceTaskId, feedbackPrompt, previousDraft, user }, deps);
   }
 
   /**
    * Start a DEV Agent run — reads approved UX artifacts, produces implementation plan.
    */
-  async runDEVAgent({ projectId, sourceTaskId, feedbackPrompt = '', user }) {
-    const sourceTask = await this._requireApprovedTask(sourceTaskId, 'ux-agent', user);
-    const effectiveProjectId = projectId || sourceTask.projectId;
-
-    // Also load PO artifacts for DEV context
-    const poTask = await Task.findLatestByProject(effectiveProjectId, 'po-agent', 'completed', 'committed');
-    const [uxArtifacts, poArtifacts] = await Promise.all([
-      AgentArtifact.findByTaskId(sourceTask.id),
-      poTask ? AgentArtifact.findByTaskId(poTask.id) : Promise.resolve([]),
-    ]);
-
-    const inputHash = contentHash({
-      artifacts: [...uxArtifacts, ...poArtifacts].map((a) => a.contentHash),
-      feedbackPrompt,
-    });
-
-    const task = await Task.create({
-      id: uuidv4(),
-      projectId: sourceTask.projectId,
-      type: 'dev-agent',
-      status: 'pending',
-      inputContentHash: inputHash,
-      sourceRunId: sourceTask.id,
-      versionStatus: 'draft',
-    });
-
-    const context = await this._buildContextFromArtifacts([...poArtifacts, ...uxArtifacts], { feedbackPrompt });
-    this._runAgent(task, context, user?.id).catch((err) => console.error('[SDLC] DEV Agent failed:', err));
-
-    return task;
+  async runDEVAgent({ projectId, sourceTaskId, feedbackPrompt = '', previousDraft = null, user }) {
+    const deps = {
+      contentHash,
+      runAgent: (t, ctx, uid) => this._runAgent(t, ctx, uid),
+      requireApprovedTask: (tid, type, u) => this._requireApprovedTask(tid, type, u),
+      buildContextFromArtifacts: (arts, extras) => this._buildContextFromArtifacts(arts, extras),
+      getRepoContext: (pid, sid) => this._getRepoContext(pid, sid),
+    };
+    return workflowOrchestrator.runDEVAgent({ projectId, sourceTaskId, feedbackPrompt, previousDraft, user }, deps);
   }
 
   /**
    * Start a QA Agent run — reads DEV artifacts + all upstream, produces test cases.
    */
-  async runQAAgent({ projectId, sourceTaskId, feedbackPrompt = '', user }) {
-    const sourceTask = await this._requireApprovedTask(sourceTaskId, 'dev-agent', user);
-    const effectiveProjectId = projectId || sourceTask.projectId;
-
-    const [poTask, uxTask] = await Promise.all([
-      Task.findLatestByProject(effectiveProjectId, 'po-agent', 'completed', 'committed'),
-      Task.findLatestByProject(effectiveProjectId, 'ux-agent', 'completed', 'committed'),
-    ]);
-
-    const allArtifacts = (
-      await Promise.all([
-        poTask ? AgentArtifact.findByTaskId(poTask.id) : Promise.resolve([]),
-        uxTask ? AgentArtifact.findByTaskId(uxTask.id) : Promise.resolve([]),
-        AgentArtifact.findByTaskId(sourceTask.id),
-      ])
-    ).flat();
-
-    const inputHash = contentHash({
-      artifacts: allArtifacts.map((a) => a.contentHash),
-      feedbackPrompt,
-    });
-
-    const task = await Task.create({
-      id: uuidv4(),
-      projectId: sourceTask.projectId,
-      type: 'qa-agent',
-      status: 'pending',
-      inputContentHash: inputHash,
-      sourceRunId: sourceTask.id,
-      versionStatus: 'draft',
-    });
-
-    const context = await this._buildContextFromArtifacts(allArtifacts, { feedbackPrompt });
-    this._runAgent(task, context, user?.id).catch((err) => console.error('[SDLC] QA Agent failed:', err));
-
-    return task;
+  async runQAAgent({ projectId, sourceTaskId, feedbackPrompt = '', previousDraft = null, user }) {
+    const deps = {
+      contentHash,
+      runAgent: (t, ctx, uid) => this._runAgent(t, ctx, uid),
+      requireApprovedTask: (tid, type, u) => this._requireApprovedTask(tid, type, u),
+      buildContextFromArtifacts: (arts, extras) => this._buildContextFromArtifacts(arts, extras),
+      getRepoContext: (pid, sid) => this._getRepoContext(pid, sid),
+    };
+    return workflowOrchestrator.runQAAgent({ projectId, sourceTaskId, feedbackPrompt, previousDraft, user }, deps);
   }
 
   // =========================================================================
@@ -655,13 +197,10 @@ class SdlcWorkflowService {
     if (!['APPROVE', 'REJECT', 'REQUEST_CHANGES'].includes(decision)) {
       throw new ApiError(400, 'Decision must be APPROVE | REJECT | REQUEST_CHANGES');
     }
-    if (task.type === 'qa-agent' && decision === 'APPROVE' && task.result?.gateRecommendation !== 'PASS') {
-      throw new ApiError(409, 'QA quality gate must PASS before final approval');
-    }
     const gateEvaluation = this._evaluateGatePolicy(task);
     if (decision === 'APPROVE'
-        && gateEvaluation.recommendation === 'HOLD'
-        && task.gateMode === GATE_MODE.CONFIDENCE) {
+      && gateEvaluation.recommendation === 'HOLD'
+      && task.gateMode === GATE_MODE.CONFIDENCE) {
       throw new ApiError(409, 'Low-confidence output must be sent back to the owning worker with reviewer feedback');
     }
 
@@ -678,17 +217,17 @@ class SdlcWorkflowService {
 
     if (decision === 'APPROVE') {
       await Task.commitTask(taskId);
+      // See resolveOutputReviewGate for why this is required: a human approval
+      // must override any validator-flagged INVALID artifact status, otherwise
+      // _requireApprovedTask's hasInvalid check blocks the next agent anyway.
+      await AgentArtifact.setStatusByTaskId(taskId, 'VALID');
       await this._recordApprovedHandoff(task, hitlRecord);
       const refreshed = await Task.findById(taskId);
       await this._startNextAgentIfAvailable(refreshed, user?.id);
     } else if (decision === 'REQUEST_CHANGES' && comment) {
-      // Trigger targeted rework automatically in the background
-      this.triggerRework({
-        projectId: task.projectId,
-        sourceTaskId: taskId,
-        feedbackPrompt: comment,
-        user
-      }).catch(err => console.error('[SDLC] Rework triggered by gate decision failed:', err));
+      // Re-run the owning agent directly (no LLM routing — we already know the task type).
+      this._rerunOwningWorker({ rejectedTask: task, feedbackPrompt: comment, user })
+        .catch(err => console.error('[SDLC] Rework failed:', err));
     }
 
     return { task, hitlDecision: hitlRecord };
@@ -705,70 +244,19 @@ class SdlcWorkflowService {
    * and measurable before a human may approve. Returns { ok, violations }.
    */
   _validateGateOutput(task, output) {
-    const out = output || {};
-    const rules = OUTPUT_CONTRACTS[task.type] || [];
-    const violations = [];
+    return gateManager.validateGateOutput(task, output);
+  }
 
-    for (const rule of rules) {
-      if (rule.when && !rule.when(out, task)) continue;
-      if (rule.check(out, task)) continue;
-      const detail = typeof rule.detail === 'function' ? rule.detail(out, task) : rule.detail;
-      violations.push({ rule: rule.rule, detail, severity: rule.severity });
-    }
+  _layerOf(ruleName) {
+    return gateManager.layerOf(ruleName);
+  }
 
-    const blockers = violations.filter((v) => v.severity === 'BLOCKER');
-    return { ok: blockers.length === 0, violations };
+  _threeLayerSummary(task, output) {
+    return gateManager.threeLayerSummary(task, output);
   }
 
   _evaluateGatePolicy(task) {
-    const output = task.agentOutput || {};
-    const validation = this._validateGateOutput(task, output);
-    const confidence = Number(output.confidence_score ?? 0.95);
-    const lowConfidence = !Number.isFinite(confidence) || confidence < AUTO_APPROVE_CONFIDENCE;
-    const warnings = validation.violations.filter((violation) => violation.severity === 'WARNING');
-    const securityIssues = Array.isArray(output.security_gate?.issues) ? output.security_gate.issues : [];
-    const needsHuman = task.gateMode === GATE_MODE.STRICT_MANUAL || !validation.ok || warnings.length > 0 || lowConfidence || securityIssues.length > 0;
-    const reasons = [];
-    const issues = [];
-    if (task.gateMode === GATE_MODE.STRICT_MANUAL) reasons.push('This gate always requires a human decision.');
-    if (lowConfidence) {
-      reasons.push(`Confidence ${confidence.toFixed(2)} is below the ${AUTO_APPROVE_CONFIDENCE.toFixed(2)} threshold.`);
-      issues.push({
-        code: 'low_confidence',
-        severity: 'WARNING',
-        detail: `The ${task.type.replace('-agent', '').toUpperCase()} worker returned confidence ${confidence.toFixed(2)}. The required threshold is ${AUTO_APPROVE_CONFIDENCE.toFixed(2)}.`,
-        suggestedAction: 'Tell the worker what to improve and send the output back for a new run.',
-      });
-    }
-    if (!validation.ok) reasons.push('Validation found blocking issues.');
-    if (warnings.length > 0) reasons.push(`Validation found ${warnings.length} warning(s).`);
-    for (const violation of validation.violations) {
-      issues.push({
-        code: violation.rule,
-        severity: violation.severity,
-        detail: violation.detail,
-        suggestedAction: 'Include this issue in the reviewer feedback before rerunning the worker.',
-      });
-    }
-    for (const issue of securityIssues) {
-      issues.push({
-        code: issue.code || 'security_review',
-        severity: issue.severity || 'HIGH',
-        detail: issue.detail || 'Security evidence requires human review.',
-        suggestedAction: issue.expected_fix || 'Send the security requirement back to DEV and rerun the sandbox checks.',
-      });
-    }
-
-    return {
-      complexity: task.type.replace('-agent', ''),
-      gateType: task.gateMode,
-      score: Math.round(confidence * 100),
-      confidence,
-      recommendation: needsHuman ? 'HOLD' : 'PASS',
-      summary: reasons.join(' ') || 'Confidence and validation checks passed. Safe to auto-approve.',
-      issues,
-      validation,
-    };
+    return gateManager.evaluateGatePolicy(task);
   }
 
   /**
@@ -795,7 +283,7 @@ class SdlcWorkflowService {
 
     // 2. Optimistic lock (plan 2.8): reject stale decisions.
     if (baseOutputVersion !== undefined && baseOutputVersion !== null
-        && Number(baseOutputVersion) !== Number(task.outputVersion || 0)) {
+      && Number(baseOutputVersion) !== Number(task.outputVersion || 0)) {
       throw new ApiError(409, `Stale output version (current ${task.outputVersion || 0}, got ${baseOutputVersion}). Reload the latest output.`);
     }
 
@@ -803,8 +291,8 @@ class SdlcWorkflowService {
     const gateEvaluation = this._evaluateGatePolicy(task);
 
     if (gateEvaluation.recommendation === 'HOLD'
-        && task.gateMode === GATE_MODE.CONFIDENCE
-        && action !== 'reject') {
+      && task.gateMode === GATE_MODE.CONFIDENCE
+      && action !== 'reject') {
       throw new ApiError(409, 'Low-confidence output must be sent back to the owning worker with reviewer feedback');
     }
 
@@ -813,34 +301,7 @@ class SdlcWorkflowService {
       const retryReason = RETRY_REASONS.includes(payload.retry_reason) ? payload.retry_reason : 'other';
       const structuredFeedback = normalizeStructuredFeedback(payload, comment);
       validateStructuredFeedback(structuredFeedback);
-      const nextRetry = (task.retryCount || 0) + 1;
-
-      if (nextRetry > MAX_RETRY_PER_STEP) {
-        await Task.update(task.id, { retryCount: nextRetry, lastRetryReason: retryReason });
-        const escalation = await HitlDecision.create({
-          id: uuidv4(), taskId: task.id, projectId: task.projectId, workflowRunId: task.projectId,
-          gate, decision: 'REJECT', action: 'escalation_required', decisionId,
-          baseOutputVersion: task.outputVersion || 0, retryReason,
-          comment: comment || 'Exceeded max retries — needs human resolution',
-          payload: { retry_count: nextRetry, status: 'needs_human_resolution', feedback: structuredFeedback },
-        });
-        return { task, hitlDecision: escalation, escalated: true };
-      }
-
-      const record = await HitlDecision.create({
-        id: uuidv4(), taskId: task.id, projectId: task.projectId, workflowRunId: task.projectId,
-        gate, decision: 'REJECT', action: 'reject', decisionId,
-        baseOutputVersion: task.outputVersion || 0, retryReason, comment,
-        payload: { retry_count: nextRetry, feedback: structuredFeedback },
-      });
-      await Task.update(task.id, { retryCount: nextRetry, lastRetryReason: retryReason });
-      const rerunTask = await this._rerunOwningWorker({
-        rejectedTask: task,
-        feedbackPrompt: JSON.stringify(structuredFeedback),
-        user,
-      });
-      await Task.update(rerunTask.id, { retryCount: nextRetry, lastRetryReason: retryReason });
-      return { task, hitlDecision: record, rerunTask };
+      return this._handleGateRejection({ task, gate, decisionId, retryReason, structuredFeedback, comment, user });
     }
 
     // ----- EDIT_APPROVE: apply JSON Patch, then validate + approve -----
@@ -853,17 +314,16 @@ class SdlcWorkflowService {
         : applyJsonPatch(currentOutput, jsonPatch);
     }
 
-    // ----- Gate validation before approve (plan 2.2) -----
+    // ----- Gate validation is informational only — a human approving the gate
+    // is the final word, same as resolveOutputReviewGate/submitGateDecision.
+    // Surfaced to the reviewer via the violations list; never blocks approve.
     const validation = this._validateGateOutput(task, approvedOutput);
-    if (!validation.ok) {
-      const blockers = validation.violations.filter((v) => v.severity === 'BLOCKER').map((v) => v.rule).join(', ');
-      throw new ApiError(422, `Gate validation failed: ${blockers}`);
-    }
 
     // ----- Commit approved output; A2A handoff uses approved_output (plan 2.4) -----
     const newVersion = (task.outputVersion || 0) + (action === 'edit_approve' ? 1 : 0);
     await Task.update(task.id, { approvedOutput, outputVersion: newVersion, version_status: 'committed' });
     await Task.commitTask(taskId);
+    await AgentArtifact.setStatusByTaskId(taskId, 'VALID');
 
     const record = await HitlDecision.create({
       id: uuidv4(), taskId: task.id, projectId: task.projectId, workflowRunId: task.projectId,
@@ -876,6 +336,345 @@ class SdlcWorkflowService {
     await this._recordApprovedHandoff(refreshed, record);
     await this._startNextAgentIfAvailable(refreshed, user?.id);
     return { task: refreshed, hitlDecision: record, validation };
+  }
+
+  // =========================================================================
+  // Gate resolution (T2.4) — wake a pending onGate approval, idempotently.
+  // =========================================================================
+
+  /**
+   * Resolve a pending gate created by _makeOnGate / gateBridge.requestGate.
+   *   type A (tool):     { action:'approve'|'reject', comment? }  (reject needs reason)
+   *   type B (question): { answers }
+   * 404 if the gate is not pending (also covers a double POST — no double action).
+   */
+  async resolveApproval({ approvalId, action, comment = '', answers = null, user }) {
+    if (!gateBridge.hasPending(approvalId)) {
+      const persisted = await gateBridge.findPersisted(approvalId);
+      if (persisted?.status === 'interrupted') {
+        throw new ApiError(409, 'This gate was interrupted by a backend restart. Re-trigger the workflow to continue.');
+      }
+      throw new ApiError(404, 'No pending approval with that id (already resolved or expired)');
+    }
+    const gate = gateBridge.getPending(approvalId);
+    if (user && gate.projectId) {
+      await MembershipService.requireProjectRole(user.id, gate.projectId, ['owner', 'admin', 'editor']);
+    }
+
+    if (gate.kind === 'question') {
+      const result = {
+        answers: answers && typeof answers === 'object'
+          ? answers
+          : (Array.isArray(answers) ? answers : (answers ? [answers] : [])),
+      };
+      // Spec §6.1 — true mid-run pause/resume.
+      // gateBridge.resolveGate() resumes the SAME Claude execution in-place:
+      // it transitions Task awaiting_gate → running, wakes the awaiting
+      // canUseTool promise, and the SDK feeds `updatedInput.answers` back
+      // to the SAME tool_use block. Same taskId, same sessionId, same
+      // conversation context. We DO NOT rerun the agent, create a new
+      // task, or create a new PipelineSession — that would violate spec
+      // §6.1 and lose the in-flight reasoning state.
+      const woke = await gateBridge.resolveGate(approvalId, result);
+
+      try {
+        const task = await Task.findById(gate.taskId);
+        if (task && gate.role) {
+          const formattedAnswers = formatAnswersForFeedback(result.answers);
+          await HitlDecision.create({
+            id: uuidv4(),
+            taskId: task.id,
+            projectId: task.projectId,
+            workflowRunId: task.projectId,
+            gate: gate.role,
+            decision: 'CLARIFICATION',
+            action: 'answer',
+            baseOutputVersion: task.outputVersion || 0,
+            comment: formattedAnswers,
+            payload: { approvalId, answers: result.answers },
+          });
+          logger.info('clarification answer recorded — same Claude execution resumes in-place', {
+            taskId: task.id,
+            sessionId: task.sessionId,
+            approvalId,
+            role: gate.role,
+          });
+        }
+      } catch (err) {
+        logger.warn('failed to record clarification HitlDecision', {
+          approvalId,
+          taskId: gate.taskId,
+          error: err.message,
+        });
+      }
+      return { approvalId, resolved: woke, kind: 'question' };
+    }
+
+    // type A (tool)
+    if (!['approve', 'reject'].includes(action)) {
+      throw new ApiError(400, "action must be 'approve' or 'reject'");
+    }
+    if (action === 'reject' && (!comment || !comment.trim())) {
+      throw new ApiError(400, 'A reject decision requires a reason (comment).');
+    }
+    const woke = await gateBridge.resolveGate(approvalId, { action, comment: comment.trim() });
+    return { approvalId, resolved: woke, kind: 'tool', action };
+  }
+
+  /**
+   * Shared reject handling: bounded re-run of the owning agent with feedback,
+   * escalating once MAX_RETRY_PER_STEP is exceeded. Used by submitStructuredDecision
+   * and resolveOutputReviewGate so both reject paths behave identically.
+   */
+  async _handleGateRejection({ task, gate, decisionId = uuidv4(), retryReason = 'other', structuredFeedback, comment, user }) {
+    const nextRetry = (task.retryCount || 0) + 1;
+    const feedback = structuredFeedback || { reason: retryReason, comment };
+
+    if (nextRetry > MAX_RETRY_PER_STEP) {
+      await Task.update(task.id, { retryCount: nextRetry, lastRetryReason: retryReason });
+      const escalation = await HitlDecision.create({
+        id: uuidv4(), taskId: task.id, projectId: task.projectId, workflowRunId: task.projectId,
+        gate, decision: 'REJECT', action: 'escalation_required', decisionId,
+        baseOutputVersion: task.outputVersion || 0, retryReason,
+        comment: comment || 'Exceeded max retries — needs human resolution',
+        payload: { retry_count: nextRetry, status: 'needs_human_resolution', feedback },
+      });
+      return { task, hitlDecision: escalation, escalated: true };
+    }
+
+    const record = await HitlDecision.create({
+      id: uuidv4(), taskId: task.id, projectId: task.projectId, workflowRunId: task.projectId,
+      gate, decision: 'REJECT', action: 'reject', decisionId,
+      baseOutputVersion: task.outputVersion || 0, retryReason, comment,
+      payload: { retry_count: nextRetry, feedback },
+    });
+    await Task.update(task.id, { retryCount: nextRetry, lastRetryReason: retryReason });
+    const rerunTask = await this._rerunOwningWorker({
+      rejectedTask: task,
+      feedbackPrompt: typeof feedback === 'string' ? feedback : JSON.stringify(feedback),
+      user,
+    });
+    await Task.update(rerunTask.id, { retryCount: nextRetry, lastRetryReason: retryReason });
+    return { task, hitlDecision: record, rerunTask };
+  }
+
+  /**
+   * Resolve the always-on "output review" gate created after every agent
+   * finishes (see _saveAgentData). Unlike resolveApproval's question/tool
+   * gates, no live agent thread is awaiting this gate's promise — the agent
+   * run already ended — so approve/reject must drive the next step directly:
+   * approve commits the output and starts the next agent; reject re-runs the
+   * same agent with the human's reason as feedback (bounded by MAX_RETRY_PER_STEP).
+   */
+  async resolveOutputReviewGate({ approvalId, action, comment = '', user }) {
+    if (!gateBridge.hasPending(approvalId)) {
+      const persisted = await gateBridge.findPersisted(approvalId);
+      if (persisted?.status === 'interrupted') {
+        throw new ApiError(409, 'This gate was interrupted by a backend restart. Re-trigger the workflow to continue.');
+      }
+      throw new ApiError(404, 'No pending approval with that id (already resolved or expired)');
+    }
+    const gate = gateBridge.getPending(approvalId);
+    if (gate.kind !== 'output_review') {
+      throw new ApiError(400, `Gate ${approvalId} is not an output review gate`);
+    }
+    if (user && gate.projectId) {
+      await MembershipService.requireProjectRole(user.id, gate.projectId, ['owner', 'admin', 'editor']);
+    }
+    if (!['approve', 'reject'].includes(action)) {
+      throw new ApiError(400, "action must be 'approve' or 'reject'");
+    }
+    if (action === 'reject' && (!comment || !comment.trim())) {
+      throw new ApiError(400, 'A reject decision requires a reason (comment).');
+    }
+
+    const task = await Task.findById(gate.taskId);
+    if (!task) throw new ApiError(404, 'Task not found for this gate');
+    const gateType = AGENT_GATES[task.type];
+
+    await gateBridge.resolveGate(approvalId, { action, comment: comment.trim() });
+
+    if (action === 'approve') {
+      await Task.update(task.id, { approvedOutput: task.agentOutput, version_status: 'committed' });
+      await Task.commitTask(task.id);
+      // A human explicitly approved this output despite any validator-flagged
+      // issues (shown in the gate payload's validationIssues) — that decision
+      // overrides the INVALID artifact status, otherwise _requireApprovedTask's
+      // hard `hasInvalid` check throws right after approval and the pipeline
+      // can never advance past a flawed-but-approved output.
+      await AgentArtifact.setStatusByTaskId(task.id, 'VALID');
+      // T1 (B5/B10) — spec §7.2: Approve must drive Write→Add→Commit→Push before
+      // waking the next agent. add+commit are mandatory; push is best-effort and
+      // never blocks the pipeline (failures are surfaced via runtime_log).
+      await repoService.commitAndPushOnApprove({
+        task,
+        onLog: (message, meta = {}) => {
+          publishEvent('runtime_log',
+            { projectId: task.projectId, sessionId: task.sessionId, taskId: task.id, role: null },
+            {
+              taskId: task.id,
+              level: meta.level || 'info',
+              source: 'auto_commit',
+              message,
+              meta,
+            },
+          );
+        },
+      });
+      const approval = await HitlDecision.create({
+        id: uuidv4(), taskId: task.id, projectId: task.projectId, workflowRunId: task.projectId,
+        gate: gateType, decision: 'APPROVE', action: 'approve',
+        baseOutputVersion: task.outputVersion || 0, comment: comment.trim(),
+        payload: { approvalId },
+      });
+      const refreshed = await Task.findById(task.id);
+      await this._recordApprovedHandoff(refreshed, approval);
+      await this._startNextAgentIfAvailable(refreshed, user?.id);
+
+      // §19.3 / A.1: the pipeline is NOT complete after QA approval. It is
+      // only complete after the FINAL_RELEASE gate has been approved and the
+      // release bundle (final.md + qa-report.md + audit-trail.json) has been
+      // written, committed, and pushed to the user's repository.
+      //
+      // What we do here, instead:
+      //   1. Build the release-evidence summary up-front so the gate payload
+      //      has data to show the operator.
+      //   2. Resolve repoContext now (cheap; already cached). If the user's
+      //      repo was never cloned (shouldn't happen — session creation
+      //      always provisions it), fail loudly instead of silently falling
+      //      back to a placeholder URL.
+      //   3. Mark the session as awaiting_release BEFORE creating the gate,
+      //      so the FE reads the correct status via the persisted row.
+      //   4. Create the FINAL_RELEASE gate. pipeline_completed is owned by
+      //      releaseManager.submitReleaseDecision now (see releaseManager.js
+      //      APPROVE branch), not by this path.
+      if (task.type === 'qa-agent'
+          && qaGatePassed(refreshed)
+          && refreshed.sessionId && refreshed.projectId) {
+        const evidence = await this._buildReleaseEvidenceSummary(refreshed.sessionId);
+        const repoContext = await this._getRepoContext(refreshed.projectId, refreshed.sessionId);
+        if (!repoContext?.repoPath) {
+          throw new ApiError(500,
+            'Cannot create FINAL_RELEASE gate: session has no cloned repository workspace. ' +
+            'Repository must be the user-provided repo — no default/placeholder is allowed.');
+        }
+        await PipelineSession.update(refreshed.sessionId, { status: 'awaiting_release' });
+        gateBridge.requestGate({
+          taskId: refreshed.id,
+          sessionId: refreshed.sessionId,
+          projectId: refreshed.projectId,
+          role: 'release',
+          kind: 'release',
+          payload: {
+            summary: 'Final release decision — review the bundled evidence below. ' +
+                     'Approving will generate final.md + qa-report.md + audit-trail.json, ' +
+                     'remove any previously generated release artifacts in the repo, ' +
+                     'commit the bundle, and push.',
+            evidence,
+            repoContext: {
+              repoUrl: repoContext.repoUrl,
+              workingBranch: repoContext.workingBranch,
+              baseBranch: repoContext.baseBranch,
+            },
+          },
+        });
+      }
+
+      return { approvalId, action, task: refreshed, hitlDecision: approval };
+    }
+
+    const result = await this._handleGateRejection({
+      task,
+      gate: gateType,
+      retryReason: 'other',
+      comment: comment.trim(),
+      user,
+    });
+    return { approvalId, action, ...result };
+  }
+
+  /** List pending gates for a task or project (poll-friendly for SSE/UI).
+   * Pass `taskIds` (a Set) to narrow a project-wide query down to one
+   * session's tasks — needed once a project can run several sessions at once. */
+  async listPendingGates({ taskId = null, projectId = null, taskIds = null } = {}) {
+    const memory = gateBridge.listPending({ taskId, projectId });
+    const interrupted = await gateBridge.listInterrupted({ taskId, projectId });
+    const combined = [...memory, ...interrupted.filter((gate) => !memory.some((item) => item.approvalId === gate.approvalId))];
+    return taskIds ? combined.filter((gate) => taskIds.has(gate.taskId)) : combined;
+  }
+
+  /** List and enrich all active/interrupted pending interventions across all projects. */
+  /** All active/interrupted pending interventions, optionally scoped to one project
+   * (the dashboard always passes the current project so sessions from other
+   * projects never leak into a user's gate list). */
+  async getAllInterventions(user, projectId = null) {
+    const prisma = require('../config/database');
+
+    // 1. Get all pending gates (optionally scoped to a single project)
+    const gates = await this.listPendingGates(projectId ? { projectId } : {});
+
+    // 2. Enrich each gate with Project, Task, and (for output review) the
+    // agent's actual output so the frontend can render it without a refetch.
+    const enriched = [];
+    for (const gate of gates) {
+      if (!gate.projectId) continue;
+
+      // Fetch project to get the name
+      const project = await prisma.project.findUnique({
+        where: { id: gate.projectId },
+      });
+
+      const task = await Task.findById(gate.taskId);
+
+      if (!project || !task) continue;
+
+      // Extract raw payload
+      const payloadParsed = gate.payload || {};
+
+      // Parse questions if kind is question
+      let questionsList = [];
+      if (gate.kind === 'question' && Array.isArray(payloadParsed.questions)) {
+        questionsList = payloadParsed.questions.map((q) =>
+          typeof q === 'object' && q !== null ? q.question : String(q)
+        );
+      }
+
+      // Map PendingGate to GlobalInterventionItem format
+      let type = 'HITL_REVIEW';
+      if (gate.kind === 'output_review') {
+        type = OUTPUT_REVIEW_GATE_TYPE[task.type] || 'AGENT_OUTPUT_REVIEW';
+      } else if (gate.role === 'PO' || gate.role === 'po-agent') {
+        type = 'PO_CLARIFY';
+      } else if (gate.role === 'DEV' || gate.role === 'dev-agent' || gate.kind === 'tool') {
+        type = 'DEV_FILE_GATE';
+      } else if (gate.role === 'RELEASE' || gate.role === 'qa-agent') {
+        type = 'FINAL_RELEASE';
+      }
+
+      enriched.push({
+        id: gate.approvalId,
+        type,
+        status: (gate.status || 'PENDING').toUpperCase(),
+        payload: {
+          path: payloadParsed.file_path || (payloadParsed.display && payloadParsed.display.filePath) || '',
+          reason: payloadParsed.reason || '',
+          diff: payloadParsed.diff || (payloadParsed.display && payloadParsed.display.diffPreview) || '',
+          questions: questionsList,
+          outputSummary: gate.kind === 'output_review' ? (payloadParsed.summary || null) : undefined,
+          validationIssues: gate.kind === 'output_review' ? (payloadParsed.validationIssues || []) : undefined,
+        },
+        createdAt: new Date(gate.createdAt).toISOString(),
+        updatedAt: new Date(gate.updatedAt || gate.createdAt).toISOString(),
+        projectId: project.id,
+        projectName: project.name,
+        sessionId: task.sessionId || null,
+        repoUrl: '',
+        pipelineStatus: task.status,
+        currentPhase: task.type.replace('-agent', '').toUpperCase(),
+      });
+    }
+
+    return enriched;
   }
 
   // =========================================================================
@@ -892,9 +691,9 @@ class SdlcWorkflowService {
     if (!rejectedTask) throw new ApiError(404, 'Source task not found');
     if (user) await MembershipService.requireProjectRole(user.id, rejectedTask.projectId, ['owner', 'admin', 'editor']);
 
-    if (rejectedTask.type === 'intent-agent') {
+    if (rejectedTask.type === 'architecture-agent') {
       const featureRequest = await this._getFeatureRequestFromIntentTask(rejectedTask);
-      return this.runIntentAgent({
+      return this.runArchitectureAgent({
         projectId: rejectedTask.projectId,
         featureRequest,
         feedbackPrompt,
@@ -942,60 +741,32 @@ class SdlcWorkflowService {
   // Final Review Packet
   // =========================================================================
 
-  async getFinalReviewPacket(projectId, user) {
-    if (user) {
-      await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer']);
-    }
-
-    const [intentTask, poTask, uxTask, devTask, qaTask] = await Promise.all([
-      Task.findLatestByProject(projectId, 'intent-agent', 'completed', 'committed'),
-      Task.findLatestByProject(projectId, 'po-agent', 'completed', 'committed'),
-      Task.findLatestByProject(projectId, 'ux-agent', 'completed', 'committed'),
-      Task.findLatestByProject(projectId, 'dev-agent', 'completed', 'committed'),
-      Task.findLatestByProject(projectId, 'qa-agent', 'completed'),
-    ]);
-
-    const allArtifacts = (
-      await Promise.all([
-        intentTask ? AgentArtifact.findByTaskId(intentTask.id) : Promise.resolve([]),
-        poTask ? AgentArtifact.findByTaskId(poTask.id) : Promise.resolve([]),
-        uxTask ? AgentArtifact.findByTaskId(uxTask.id) : Promise.resolve([]),
-        devTask ? AgentArtifact.findByTaskId(devTask.id) : Promise.resolve([]),
-        qaTask ? AgentArtifact.findByTaskId(qaTask.id) : Promise.resolve([]),
-      ])
-    ).flat();
-
-    const hitlDecisions = await HitlDecision.findByProjectId(projectId);
-
-    return {
-      phases: {
-        intent: intentTask ? { taskId: intentTask.id, status: intentTask.status, versionStatus: intentTask.versionStatus } : null,
-        po: poTask ? { taskId: poTask.id, status: poTask.status, versionStatus: poTask.versionStatus } : null,
-        ux: uxTask ? { taskId: uxTask.id, status: uxTask.status, versionStatus: uxTask.versionStatus } : null,
-        dev: devTask ? { taskId: devTask.id, status: devTask.status, versionStatus: devTask.versionStatus } : null,
-        qa: qaTask ? { taskId: qaTask.id, status: qaTask.status, versionStatus: qaTask.versionStatus } : null,
-      },
-      artifacts: await Promise.all(allArtifacts.map((a) => formatArtifactForClient(a))),
-      hitlDecisions,
-      generatedAt: new Date().toISOString(),
-    };
+  async getFinalReviewPacket(sessionId, user) {
+    return workflowQueries.getFinalReviewPacket(sessionId, user);
   }
 
   // =========================================================================
   // Audit Trail
   // =========================================================================
 
-  async getAuditTrail(projectId, user) {
+  /** `sessionId`, when given, narrows the (otherwise project-wide) audit
+   * trail to just that session's tasks/decisions — needed once a project can
+   * run several sessions concurrently. */
+  async getAuditTrail(projectId, user, sessionId = null) {
     if (user) {
       await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer']);
     }
 
-    const [tasks, hitlDecisions] = await Promise.all([
-      Task.findByProjectId(projectId),
+    let [tasks, hitlDecisions] = await Promise.all([
+      sessionId ? Task.findBySessionId(sessionId) : Task.findByProjectId(projectId),
       HitlDecision.findByProjectId(projectId),
     ]);
+    if (sessionId) {
+      const taskIds = new Set(tasks.map((t) => t.id));
+      hitlDecisions = hitlDecisions.filter((d) => taskIds.has(d.taskId));
+    }
 
-    const sdlcTasks = tasks.filter((t) => ['intent-agent', 'po-agent', 'ux-agent', 'dev-agent', 'qa-agent'].includes(t.type));
+    const sdlcTasks = tasks.filter((t) => ['architecture-agent', 'po-agent', 'ux-agent', 'dev-agent', 'qa-agent'].includes(t.type));
     const handoffArtifacts = (
       await Promise.all(sdlcTasks.map((task) => AgentArtifact.findByTaskIdAndType(task.id, 'a2a_handoff')))
     ).flat();
@@ -1113,6 +884,19 @@ class SdlcWorkflowService {
           type: 'a2a_handoff',
         };
       }),
+      // T2.3: onGate audit (auto/approval/block/question) for the claude-code path.
+      ...sdlcTasks.flatMap((t) => this._getGateAudit(t.id).map((g) => ({
+        timestamp: g.timestamp,
+        actor: g.kind === 'GATE_AUTO' || g.kind === 'GATE_BLOCK' ? 'ORCHESTRATOR' : 'HUMAN',
+        action: g.kind,
+        taskId: t.id,
+        agent: t.type,
+        comment: g.comment || g.detail || null,
+        reason: g.detail || null,
+        file: g.file || null,
+        category: g.category || null,
+        type: 'gate_audit',
+      }))),
     ].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
     // I3: synthesize a consistent PHASE_TRANSITION chain from the existing
@@ -1151,192 +935,39 @@ class SdlcWorkflowService {
    * audit trail remains the single source of truth.
    */
   async getWorkflowMetrics(projectId, user) {
-    if (user) {
-      await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer']);
-    }
-
-    const [tasks, hitlDecisions] = await Promise.all([
-      Task.findByProjectId(projectId),
-      HitlDecision.findByProjectId(projectId),
-    ]);
-    const sdlcTasks = tasks.filter((t) => ['intent-agent', 'po-agent', 'ux-agent', 'dev-agent', 'qa-agent'].includes(t.type));
-    const taskById = Object.fromEntries(sdlcTasks.map((t) => [t.id, t]));
-    const gateDecisions = hitlDecisions.filter((d) => d.gate !== FINAL_GATE);
-
-    // ----- Cycle time: first agent start → release decision (or latest task update) -----
-    const startTs = sdlcTasks.length ? Math.min(...sdlcTasks.map((t) => new Date(t.createdAt).getTime())) : null;
-    const releaseDecision = [...hitlDecisions].reverse().find((d) => d.gate === FINAL_GATE) || null;
-    const endTs = releaseDecision
-      ? new Date(releaseDecision.createdAt).getTime()
-      : (sdlcTasks.length ? Math.max(...sdlcTasks.map((t) => new Date(t.updatedAt).getTime())) : null);
-    const cycleTimeSeconds = startTs && endTs ? Math.max(0, Math.round((endTs - startTs) / 1000)) : null;
-
-    // ----- Time per agent (average wall time of completed runs, in seconds) -----
-    const timePerAgent = {};
-    for (const stage of ['po-agent', 'ux-agent', 'dev-agent', 'qa-agent']) {
-      const runs = sdlcTasks.filter((t) => t.type === stage && t.status === 'completed');
-      const durations = runs.map((t) => Math.max(0, (new Date(t.updatedAt).getTime() - new Date(t.createdAt).getTime()) / 1000));
-      timePerAgent[stage] = {
-        runs: runs.length,
-        avg_seconds: durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : null,
-      };
-    }
-
-    // ----- Approval / rejection / rerun distribution -----
-    const autoApprovals = gateDecisions.filter((d) => d.action === 'auto_approve').length;
-    const humanApprovals = gateDecisions.filter((d) => d.decision === 'APPROVE' && d.action !== 'auto_approve').length;
-    const rejections = gateDecisions.filter((d) => d.decision === 'REJECT' && d.action !== 'escalation_required').length;
-    const escalations = gateDecisions.filter((d) => d.action === 'escalation_required').length;
-    const totalApprovals = autoApprovals + humanApprovals;
-    const totalDecisions = totalApprovals + rejections + escalations;
-    const pct = (num, den) => (den > 0 ? Math.round((num / den) * 1000) / 10 : 0);
-
-    const rerunCountPerStage = {};
-    const gateFailureReasons = {};
-    for (const d of gateDecisions) {
-      if (d.decision === 'REJECT' || d.action === 'escalation_required') {
-        const stage = taskById[d.taskId]?.type || 'unknown';
-        rerunCountPerStage[stage] = (rerunCountPerStage[stage] || 0) + 1;
-        const reason = d.retryReason || 'other';
-        gateFailureReasons[reason] = (gateFailureReasons[reason] || 0) + 1;
-      }
-    }
-
-    // ----- False auto-approval: auto-approved task later rejected by a human -----
-    const rejectedTaskIds = new Set(gateDecisions.filter((d) => d.decision === 'REJECT').map((d) => d.taskId));
-    const falseAutoApprovals = gateDecisions.filter((d) => d.action === 'auto_approve' && rejectedTaskIds.has(d.taskId)).length;
-
-    // ----- Sandbox / QA / coverage from the latest committed outputs -----
-    const devTask = await Task.findLatestByProject(projectId, 'dev-agent', 'completed', 'committed');
-    const qaTask = await Task.findLatestByProject(projectId, 'qa-agent', 'completed');
-    const sandbox = devTask?.approvedOutput?.sandbox_result || devTask?.agentOutput?.sandbox_result || null;
-    const qaOutput = qaTask?.approvedOutput || qaTask?.agentOutput || {};
-    const deadLetterTasks = sdlcTasks.filter((t) => (t.retryCount || 0) > MAX_RETRY_PER_STEP).length + escalations;
-
-    return {
-      projectId,
-      generatedAt: new Date().toISOString(),
-      cycle_time_seconds: cycleTimeSeconds,
-      time_per_agent: timePerAgent,
-      auto_approval_rate: pct(autoApprovals, totalApprovals),
-      human_rejection_rate: pct(rejections, totalDecisions),
-      rerun_count_per_stage: rerunCountPerStage,
-      gate_failure_reason_distribution: gateFailureReasons,
-      sandbox_pass: sandbox ? (sandbox.build_ok !== false && sandbox.tests_ran === true) : null,
-      qa_gate: qaTask?.result?.gateRecommendation || null,
-      requirement_coverage_percentage: qaOutput.coverage_summary?.percentage ?? null,
-      false_auto_approval_rate: pct(falseAutoApprovals, autoApprovals),
-      dead_letter_count: deadLetterTasks,
-      counts: {
-        total_runs: sdlcTasks.length,
-        auto_approvals: autoApprovals,
-        human_approvals: humanApprovals,
-        rejections,
-        escalations,
-        total_decisions: totalDecisions,
-      },
-      agent_policy: AGENT_POLICY,
-    };
+    return workflowQueries.getWorkflowMetrics(projectId, user);
   }
 
-  async submitReleaseDecision({ projectId, decisionId, decision, comment = '', user }) {
-    if (!RELEASE_DECISIONS.includes(decision)) {
-      throw new ApiError(400, 'decision must be APPROVE | REJECT');
-    }
-    if (!decisionId) throw new ApiError(400, 'decision_id is required (idempotency key)');
-
-    const membership = user
-      ? await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer'])
-      : null;
-    if (membership && !['owner', 'admin'].includes(membership.role)) {
-      throw new ApiError(403, 'Only project owners and admins may approve or reject a release.');
-    }
-
-    const existing = await HitlDecision.findByDecisionId(decisionId);
-    if (existing) return { hitlDecision: existing, idempotentReplay: true };
-    const priorDecisions = await HitlDecision.findByProjectId(projectId);
-    const priorReleaseDecision = [...priorDecisions].reverse().find((record) => record.gate === FINAL_GATE);
-    if (priorReleaseDecision && ['APPROVE', 'REJECT'].includes(priorReleaseDecision.decision)) {
-      throw new ApiError(409, `Release already finalized as ${priorReleaseDecision.decision}`);
-    }
-
-    const qaTask = await Task.findLatestByProject(projectId, 'qa-agent', 'completed', 'committed');
-    if (!qaTask) throw new ApiError(409, 'Release gate is unavailable until QA is approved');
-    if (qaTask.result?.gateRecommendation !== 'PASS') {
-      throw new ApiError(409, 'Release gate is unavailable until QA quality gate returns PASS');
-    }
-    const evidence = await this._buildReleaseEvidenceSummary(projectId);
-    if (decision === 'APPROVE' && evidence.open_blockers.some((blocker) => GATE_CONFIG.RELEASE_BLOCKING_SEVERITIES.includes(blocker.severity))) {
-      throw new ApiError(409, 'Release approval is blocked until all critical and high-risk evidence issues are resolved');
-    }
-
-    const releaseComment = comment || {
-      APPROVE: 'Release approved by authorized reviewer',
-      REJECT: 'Release rejected by authorized reviewer',
-    }[decision];
-    const record = await HitlDecision.create({
-      id: uuidv4(),
-      workflowRunId: projectId,
-      taskId: qaTask.id,
-      projectId,
-      gate: FINAL_GATE,
-      decision,
-      action: `release_${decision.toLowerCase()}`,
-      decisionId,
-      comment: releaseComment,
-      reviewerId: user?.id || null,
-      payload: {
-        release_status: {
-          APPROVE: 'released',
-          REJECT: 'rejected',
-        }[decision],
-        reviewer_role: membership?.role || null,
-        evidence,
+  async submitReleaseDecision({ sessionId, decisionId, decision, comment = '', user }) {
+    return releaseManager.submitReleaseDecision({
+      sessionId, decisionId, decision, comment, user,
+      deps: {
+        getFinalReviewPacket: (sid, u) => this.getFinalReviewPacket(sid, u),
+        getAuditTrail: (pid, u, sid) => this.getAuditTrail(pid, u, sid),
+        getRepoContext: (pid, sid) => this._getRepoContext(pid, sid),
       },
     });
-
-    return { hitlDecision: record };
   }
 
-  async _buildReleaseEvidenceSummary(projectId) {
-    const [poTask, uxTask, devTask, qaTask] = await Promise.all([
-      Task.findLatestByProject(projectId, 'po-agent', 'completed', 'committed'),
-      Task.findLatestByProject(projectId, 'ux-agent', 'completed', 'committed'),
-      Task.findLatestByProject(projectId, 'dev-agent', 'completed', 'committed'),
-      Task.findLatestByProject(projectId, 'qa-agent', 'completed', 'committed'),
-    ]);
-    const risk = poTask?.approvedOutput?.risk_classification || poTask?.agentOutput?.risk_classification || null;
-    const securityGate = devTask?.approvedOutput?.security_gate || devTask?.agentOutput?.security_gate || null;
-    const qaOutput = qaTask?.approvedOutput || qaTask?.agentOutput || {};
-    const openBlockers = [
-      ...(securityGate?.issues || []),
-      ...((qaOutput.blocker_count || 0) > 0 ? [{ severity: 'BLOCKER', code: 'qa_blockers', detail: `${qaOutput.blocker_count} QA blocker(s) remain.` }] : []),
-    ];
-    return {
-      feature: poTask?.approvedOutput?.feature_request || poTask?.agentOutput?.feature_request || null,
-      risk,
-      versions: {
-        po: poTask ? { task_id: poTask.id, output_version: poTask.outputVersion } : null,
-        ux: uxTask ? { task_id: uxTask.id, output_version: uxTask.outputVersion } : null,
-        dev: devTask ? { task_id: devTask.id, output_version: devTask.outputVersion } : null,
-        qa: qaTask ? { task_id: qaTask.id, output_version: qaTask.outputVersion } : null,
-      },
-      sandbox_result: devTask?.approvedOutput?.sandbox_result || devTask?.agentOutput?.sandbox_result || null,
-      security_gate: securityGate,
-      qa_gate: qaTask?.result?.gateRecommendation || null,
-      coverage_percentage: qaOutput.coverage_summary?.percentage ?? null,
-      open_blockers: openBlockers,
-    };
+  async _buildReleaseEvidenceSummary(sessionId) {
+    return releaseManager.buildReleaseEvidenceSummary(sessionId);
   }
 
   async _rerunOwningWorker({ rejectedTask, feedbackPrompt, user }) {
-    if (rejectedTask.type === 'intent-agent') {
+    const previousArtifacts = await AgentArtifact.findByTaskId(rejectedTask.id);
+    const previousDraft = previousArtifacts.length > 0 
+      ? JSON.stringify(previousArtifacts.reduce((acc, a) => { acc[a.artifactType] = a.contentJson || a.contentText; return acc; }, {}))
+      : undefined;
+
+    if (rejectedTask.type === 'architecture-agent') {
       const featureRequest = await this._getFeatureRequestFromIntentTask(rejectedTask);
-      return this.runIntentAgent({ projectId: rejectedTask.projectId, featureRequest, feedbackPrompt, user });
+      return this.runArchitectureAgent({ projectId: rejectedTask.projectId, featureRequest, feedbackPrompt, user });
     }
     if (rejectedTask.type === 'po-agent') {
       const featureRequest = await this._getFeatureRequestFromTask(rejectedTask);
-      return this.runPOAgent({ projectId: rejectedTask.projectId, featureRequest, feedbackPrompt, user });
+      // Rework stays in the rejected task's own session — must NOT create a
+      // new one (that would also re-clone/copy the repo unnecessarily).
+      return this.runPOAgent({ projectId: rejectedTask.projectId, sessionId: rejectedTask.sessionId, featureRequest, feedbackPrompt, previousDraft, user });
     }
 
     const ownerTarget = {
@@ -1346,8 +977,8 @@ class SdlcWorkflowService {
     }[rejectedTask.type];
     if (!ownerTarget) throw new ApiError(400, `Cannot rerun unsupported task type: ${rejectedTask.type}`);
 
-    const upstream = await Task.findLatestByProject(
-      rejectedTask.projectId,
+    const upstream = await Task.findLatestBySession(
+      rejectedTask.sessionId,
       ownerTarget.sourceType,
       'completed',
       'committed',
@@ -1360,19 +991,59 @@ class SdlcWorkflowService {
       projectId: rejectedTask.projectId,
       sourceTaskId: upstream.id,
       feedbackPrompt,
+      previousDraft,
       user,
     });
   }
 
-  async getProjectArtifacts(projectId, user) {
-    if (user) {
-      await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer']);
+  async getProjectTasks(projectId, user) {
+    return workflowQueries.getProjectTasks(projectId, user);
+  }
+
+  async getProjectHealth() {
+    return workflowQueries.getProjectHealth();
+  }
+
+  async updateEnvSettings(keys) {
+    const fs = require('fs');
+    const path = require('path');
+    const envPath = path.resolve(process.cwd(), '.env');
+    
+    let envContent = '';
+    if (fs.existsSync(envPath)) {
+      envContent = fs.readFileSync(envPath, 'utf-8');
     }
-    const artifacts = await AgentArtifact.findByProjectId(projectId);
-    return {
-      projectId,
-      artifacts: await Promise.all(artifacts.map((artifact) => formatArtifactForClient(artifact))),
-    };
+
+    const lines = envContent.split('\n');
+    for (const [key, val] of Object.entries(keys)) {
+      if (!val) continue; // skip empty
+      const prefix = `${key}=`;
+      const quotedVal = `"${val}"`;
+      const idx = lines.findIndex(l => l.startsWith(prefix));
+      if (idx >= 0) {
+        lines[idx] = `${key}=${quotedVal}`;
+      } else {
+        lines.push(`${key}=${quotedVal}`);
+      }
+      process.env[key] = val;
+    }
+
+    fs.writeFileSync(envPath, lines.join('\n').trim() + '\n');
+    return { status: 'success' };
+  }
+
+  async getProjectArtifacts(projectId, user) {
+    return workflowQueries.getProjectArtifacts(projectId, user);
+  }
+
+  /** List a project's pipeline sessions (newest first) — the "4 session
+   * cards" board reads this to know which sessions exist and their status. */
+  async listSessions(projectId, user) {
+    return workflowQueries.listSessions(projectId, user);
+  }
+
+  async getReleaseFile(sessionId, fileName, user) {
+    return workflowQueries.getReleaseFile(sessionId, fileName, user);
   }
 
   // =========================================================================
@@ -1396,6 +1067,8 @@ class SdlcWorkflowService {
     task.hitlDecision = hitlDecision;
     task.gate = AGENT_GATES[task.type] || null;
     task.nextAgent = NEXT_AGENT[task.type];
+    // T2/T7: surface pending onGate gates (claude-code path) for the UI/SSE.
+    task.pendingGates = gateBridge.listPending({ taskId });
 
     // Attach Quality Gate evaluation for QA tasks
     if (task.type === 'qa-agent') {
@@ -1420,20 +1093,26 @@ class SdlcWorkflowService {
     return task;
   }
 
-  async getWorkflowStatus(projectId, user) {
+  async getWorkflowStatus(sessionId, user) {
+    const session = await PipelineSession.findById(sessionId);
+    if (!session) throw new ApiError(404, 'Session not found');
+    const projectId = session.projectId;
     if (user) {
       await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer']);
     }
 
-    const [intentTask, poTask, uxTask, devTask, qaTask] = await Promise.all([
-      Task.findLatestByProject(projectId, 'intent-agent', null),
-      Task.findLatestByProject(projectId, 'po-agent', null),
-      Task.findLatestByProject(projectId, 'ux-agent', null),
-      Task.findLatestByProject(projectId, 'dev-agent', null),
-      Task.findLatestByProject(projectId, 'qa-agent', null),
-    ]);
+    const tasks = await Task.findBySessionId(sessionId);
+    // Architecture agent runs before the session is created and is the entry
+    // point of the pipeline. Resolve it via the chain helper (which scans
+    // tasks by type) instead of relying on the PO task's sourceRunId — that
+    // path returns null for the first session in a project (no PO yet), and
+    // `deriveCurrentPhase` then collapses to BACKLOG even though ARCH
+    // completed successfully. Same root cause as the "fresh session stuck on
+    // backlog" bug observed via the SSE stream.
+    const { architectureTask, poTask, uxTask, devTask, qaTask } = this._selectCurrentTaskChain(tasks);
 
-    const hitlDecisions = await HitlDecision.findByProjectId(projectId);
+    const taskIds = new Set(tasks.map((t) => t.id));
+    const hitlDecisions = (await HitlDecision.findByProjectId(projectId)).filter((d) => taskIds.has(d.taskId));
     // T5: pick the most-recent non-final decision per task deterministically
     // (createdAt, then id). This keeps a rerun from getting stuck on an older
     // decision and makes parallel reruns derive the same phase every time.
@@ -1459,10 +1138,17 @@ class SdlcWorkflowService {
 
     // T1/T6: surface which completed tasks have INVALID artifacts so the UI can
     // badge the worker card and explain why the phase did not advance.
-    const phaseTasks = [intentTask, poTask, uxTask, devTask, qaTask].filter(Boolean);
+    const phaseTasks = [architectureTask, poTask, uxTask, devTask, qaTask].filter(Boolean);
     const invalidByTaskId = {};
     await Promise.all(phaseTasks.map(async (t) => {
-      invalidByTaskId[t.id] = t.status === 'completed' ? await AgentArtifact.hasInvalid(t.id) : false;
+      if (t.status !== 'completed') { invalidByTaskId[t.id] = false; return; }
+      const dbInvalid = await AgentArtifact.hasInvalid(t.id);
+      // If DB says INVALID, do a live re-check: the stored status may be stale
+      // (e.g. gate rules were tightened or loosened after the task completed).
+      // Only keep INVALID when runtime validation also finds a BLOCKER.
+      invalidByTaskId[t.id] = dbInvalid
+        ? this._validateGateOutput(t, t.agentOutput || {}).violations.some((v) => v.severity === 'BLOCKER')
+        : false;
     }));
 
     const mapPhase = (task) => {
@@ -1470,6 +1156,7 @@ class SdlcWorkflowService {
       return {
         taskId: task.id,
         status: task.status,
+        executionStatus: task.executionStatus || null,
         versionStatus: task.versionStatus,
         gate: AGENT_GATES[task.type],
         hitlDecision: decisionsByTaskId[task.id] || null,
@@ -1480,6 +1167,8 @@ class SdlcWorkflowService {
           && decisionsByTaskId[task.id]?.decision !== 'APPROVE',
         // T1: the output failed role validation (blocking) — no handoff possible.
         invalid: !!invalidByTaskId[task.id],
+        error: task.error || null,
+        failure: task.observability?.failure || null,
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
       };
@@ -1492,13 +1181,23 @@ class SdlcWorkflowService {
         featureRequest = resolved.contentJson || resolved.contentText || null;
       }
     }
-    const releaseEvidence = await this._buildReleaseEvidenceSummary(projectId);
+    const releaseEvidence = await this._buildReleaseEvidenceSummary(sessionId);
+    const pendingQuestion = this._getPendingQuestionGate(projectId, taskIds);
 
     return {
       projectId,
+      sessionId,
       featureRequest,
+      pipelineLock: pendingQuestion ? {
+        locked: true,
+        reason: 'question_pending',
+        role: pendingQuestion.role,
+        taskId: pendingQuestion.taskId,
+        approvalId: pendingQuestion.approvalId,
+        message: `${pendingQuestion.role} is waiting for a human answer`,
+      } : { locked: false },
       phases: {
-        intent: mapPhase(intentTask),
+        architecture: mapPhase(architectureTask),
         po: mapPhase(poTask),
         ux: mapPhase(uxTask),
         dev: mapPhase(devTask),
@@ -1507,7 +1206,11 @@ class SdlcWorkflowService {
       releaseGate: {
         eligible: qaTask?.status === 'completed'
           && qaTask.versionStatus === 'committed'
-          && qaTask.result?.gateRecommendation === 'PASS'
+          && (() => {
+            if (qaTask.result?.gateRecommendation === 'PASS') return true;
+            const tr = qaTask.agentOutput?.test_run_report || {};
+            return tr.executed === true && typeof tr.failed === 'number' && tr.failed === 0 && (tr.total || 0) > 0;
+          })()
           && decisionsByTaskId[qaTask.id]?.decision === 'APPROVE',
         canDecide: ['owner', 'admin'].includes(membership?.role),
         reviewerRole: membership?.role || null,
@@ -1519,38 +1222,377 @@ class SdlcWorkflowService {
         evidence: releaseEvidence,
         approvalBlocked: releaseEvidence.open_blockers.some((blocker) => GATE_CONFIG.RELEASE_BLOCKING_SEVERITIES.includes(blocker.severity)),
       },
-      currentPhase: this._deriveCurrentPhase(poTask, uxTask, devTask, qaTask, decisionsByTaskId, releaseDecision),
+      currentPhase: this._deriveCurrentPhase(architectureTask, poTask, uxTask, devTask, qaTask, decisionsByTaskId, releaseDecision),
     };
   }
+
+  // =========================================================================
+  // V4 Pipeline Response API
+  // =========================================================================
+
+  /**
+   * Fetches the workflow status and maps it to the PipelineResponse format
+   * expected by the v4 SDLC Dashboard frontend.
+   */
+  async getPipelineResponse(sessionId, user) {
+    const legacyStatus = await this.getWorkflowStatus(sessionId, user);
+    const projectId = legacyStatus.projectId;
+
+    const tasks = await Task.findBySessionId(sessionId);
+    const taskIds = new Set(tasks.map((t) => t.id));
+    const { poTask, qaTask } = this._selectCurrentTaskChain(tasks);
+
+    // Determine overall status
+    let overallStatus = 'idle';
+    if ((qaTask?.status === 'completed' && qaTask?.versionStatus === 'committed') || legacyStatus.releaseGate?.status === 'released') {
+      overallStatus = 'qa_complete';
+    } else if (legacyStatus.currentPhase !== 'draft') {
+      if (legacyStatus.currentPhase.endsWith('_REVIEW')) overallStatus = 'awaiting_approval';
+      else if (legacyStatus.currentPhase.endsWith('_RUNNING')) overallStatus = legacyStatus.currentPhase.toLowerCase();
+      else if (legacyStatus.currentPhase === 'QA_FAILED') overallStatus = 'failed';
+      else overallStatus = legacyStatus.currentPhase.toLowerCase();
+    }
+
+    // OBS-01.10 R-25: `toPhaseStatus` is now sourced from `sdlcConstants.js`.
+    // The inline closure previously read `phaseData.status` (legacy
+    // `Task.status`) — see contract §7 forbidden pattern "Deriving runtime
+    // from `Task.status` (legacy)". The extracted helper reads
+    // `phaseData.executionStatus` (canonical machine) and projects to the
+    // FE-visible `PhaseStatus` via the canonical mapping table.
+    const pipelinePhases = [
+      toPhaseStatus('Architecture', legacyStatus.phases.architecture, false),
+      toPhaseStatus('PO', legacyStatus.phases.po, false),
+      toPhaseStatus('UX', legacyStatus.phases.ux, false),
+      toPhaseStatus('DEV', legacyStatus.phases.dev, false),
+      toPhaseStatus('QA', legacyStatus.phases.qa, false),
+    ];
+
+    const pendingRaw = await this.listPendingGates({ projectId, taskIds });
+    const pendingGates = pendingRaw.map(g => ({
+      id: g.approvalId,
+      taskId: g.taskId,
+      kind: g.kind,
+      type: g.kind === 'output_review'
+        ? (OUTPUT_REVIEW_GATE_TYPE[g.role] || 'AGENT_OUTPUT_REVIEW')
+        : g.kind === 'release'
+          ? 'FINAL_RELEASE'
+          : g.kind === 'question'
+            ? (CLARIFY_GATE_TYPE[g.role] || 'AGENT_CLARIFY')
+            : 'HITL_REVIEW',
+      role: g.role,
+      status: g.status === 'interrupted' ? 'PENDING' : 'PENDING',
+      payload: g.payload || {},
+      createdAt: g.createdAt
+    }));
+
+    const auditTrail = await this.getAuditTrail(projectId, user, sessionId);
+    const auditEvents = auditTrail?.events || [];
+    const auditLog = auditEvents.map(ev => ({
+      timestamp: ev.timestamp || ev.createdAt,
+      actor: ev.actor || (ev.agent ? ev.agent.replace('-agent', '').toUpperCase() : 'SYSTEM'),
+      action: ev.action,
+      status: ev.severity === 'ERROR' || ev.type === 'failure' ? 'error' : (ev.severity === 'WARNING' ? 'warning' : 'ok')
+    }));
+
+    let qaResult = null;
+    if (qaTask?.result) {
+      qaResult = {
+        status: qaTask.result.gateRecommendation === 'PASS' ? 'passed' : 'failed',
+        coverage: qaTask.result.qa_report?.coverage || 100,
+        blockers: qaTask.result.blocker_count || 0,
+        warnings: 0,
+        reportUrl: `/api/v1/sdlc/sessions/${sessionId}/release-files/qa-report.md`,
+        commitSha: 'N/A'
+      };
+    }
+
+    return {
+      workflowId: sessionId,
+      projectId,
+      status: overallStatus,
+      pipelinePhases,
+      pendingGates,
+      auditLog,
+      qaResult,
+      releaseStatus: legacyStatus.releaseGate?.status || 'pending',
+      repoInfo: await this._buildSessionRepoInfo({ projectId, sessionId }),
+    };
+  }
+
+  /**
+   * T7 (B7) — Compose the spec §8.1 Repository / Branch / Commit SHA fields
+   * by reading the session's working repo. Best-effort: returns a partial
+   * object (with nulls) if the workspace isn't materialized yet.
+   * repoUrl is NOT stored on PipelineSession (it's transient input) — the
+   * frontend already has it on the session seed (`session.repoUrl`).
+   */
+  async _buildSessionRepoInfo({ projectId, sessionId } = {}) {
+    const live = await repoService.getSessionRepoInfo({ projectId, sessionId }).catch(() => null);
+    return {
+      repoUrl: null,
+      branch: live?.branch ?? null,
+      commitSha: live?.commitSha ?? null,
+      fileCount: live?.fileCount ?? 0,
+    };
+  }
+
 
   // =========================================================================
   // Internals
   // =========================================================================
 
-  _deriveCurrentPhase(poTask, uxTask, devTask, qaTask, decisionsByTaskId, releaseDecision = null) {
-    if (!poTask) return 'BACKLOG';
-    if (!poTask || poTask.status === 'pending' || poTask.status === 'processing') return 'PO_RUNNING';
-    if (poTask.status === 'failed') return 'PO_FAILED';
-    if (!decisionsByTaskId[poTask?.id] || decisionsByTaskId[poTask?.id]?.decision !== 'APPROVE') return 'PO_REVIEW';
-    if (!uxTask || uxTask.status === 'pending' || uxTask.status === 'processing') return 'UX_RUNNING';
-    if (uxTask.status === 'failed') return 'UX_FAILED';
-    if (!decisionsByTaskId[uxTask?.id] || decisionsByTaskId[uxTask?.id]?.decision !== 'APPROVE') return 'UX_REVIEW';
-    if (!devTask || devTask.status === 'pending' || devTask.status === 'processing') return 'DEV_RUNNING';
-    if (devTask.status === 'failed') return 'DEV_FAILED';
-    if (!decisionsByTaskId[devTask?.id] || decisionsByTaskId[devTask?.id]?.decision !== 'APPROVE') return 'DEV_REVIEW';
-    if (!qaTask || qaTask.status === 'pending' || qaTask.status === 'processing') return 'QA_RUNNING';
-    if (qaTask.status === 'failed') return 'QA_FAILED';
-    if (!decisionsByTaskId[qaTask?.id]) return 'QA_REVIEW';
-    if (releaseDecision?.decision === 'APPROVE') return 'RELEASED';
-    if (releaseDecision?.decision === 'REJECT') return 'RELEASE_REJECTED';
-    return 'FINAL_REVIEW';
+  async resumeTask(taskId, approved, feedback) {
+    const task = await Task.findById(taskId);
+
+    if (!task) throw new Error('Task not found');
+    if (task.status !== 'PENDING_TOOL_APPROVAL') throw new Error('Task is not awaiting tool approval');
+
+    // Update status to running
+    await Task.update(taskId, { status: 'running' });
+
+    // We do NOT block the API response; we handle the stream in the background
+    this._resumeAgentStream(task, approved, feedback).catch(err => {
+      console.error(`[SDLC] Resume failed for task ${taskId}:`, err);
+    });
+
+    return { success: true, message: 'Task resumed' };
+  }
+
+  async getPendingToolApprovals(projectId) {
+    const prisma = require('../config/database');
+    const tasks = await prisma.task.findMany({
+      where: { 
+        projectId, 
+        status: 'PENDING_TOOL_APPROVAL' 
+      },
+      select: {
+        id: true,
+        type: true,
+        agentOutput: true,
+      }
+    });
+
+    return tasks.map(t => ({
+      taskId: t.id,
+      agentType: t.type,
+      data: t.agentOutput ? JSON.parse(t.agentOutput) : null
+    }));
+  }
+
+  async _resumeAgentStream(task, approved, feedback) {
+    try {
+      const axios = require('axios');
+      const { getAgentUrl } = require('../config/agents');
+      const response = await axios.post(
+        getAgentUrl('/v1/agent/resume'),
+        {
+          session_id: task.id,
+          node_target: NODE_TARGET[task.type],
+          approved,
+          feedback,
+        },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          responseType: 'stream',
+        }
+      );
+
+      let buffer = '';
+      let completedData = null;
+      let requiresActionData = null;
+      let agentError = null;
+
+      response.data.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        let currentEvent = null;
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+          } else if (line.startsWith('data: ') && currentEvent) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (currentEvent === 'error') {
+                agentError = data.message || 'Agent error';
+              } else if (currentEvent === 'completed') {
+                completedData = data;
+              } else if (currentEvent === 'requires_action') {
+                requiresActionData = data;
+              }
+            } catch (_) { }
+          }
+        }
+      });
+
+      response.data.on('end', async () => {
+        try {
+          if (agentError) throw new Error(agentError);
+          
+          if (requiresActionData) {
+            console.log(`[SDLC._resumeAgentStream] Task ${task.id} requires ANOTHER tool approval.`);
+            await Task.update(task.id, {
+              status: 'PENDING_TOOL_APPROVAL',
+              error: null,
+              agentOutput: requiresActionData
+            });
+            return;
+          }
+          
+          if (!completedData) throw new Error('Agent returned no data on resume');
+          
+          // Assuming output conforms, save it
+          await this._saveAgentData(task, completedData, null);
+        } catch (err) {
+          console.error(`[SDLC._resumeAgentStream] Failed for task ${task.id}:`, err);
+          await this._markTaskFailed(task, err);
+        }
+      });
+    } catch (error) {
+      console.error(`[SDLC._resumeAgentStream] Request failed for task ${task.id}:`, error);
+      await this._markTaskFailed(task, error);
+    }
+  }
+
+  /**
+   * The agent that follows a task. Per AIFA v2.1 the chain is fixed
+   * ARCH → PO → UX → DEV → QA; no UX skip is permitted.
+   */
+  _nextAgentFor(task) {
+    return workflowHelpers.nextAgentFor(task);
+  }
+
+  async getTaskEvents(taskId, { afterSequence = null, limit = 200 } = {}, user) {
+    return workflowQueries.getTaskEvents(taskId, { afterSequence, limit }, user);
+  }
+
+  /**
+   * Select one coherent workflow chain. A QA task from an older DEV run must
+   * never appear beside the current DEV task.
+   */
+  _selectCurrentTaskChain(tasks = []) {
+    return workflowHelpers.selectCurrentTaskChain(tasks);
+  }
+
+  _deriveCurrentPhase(architectureTask, poTask, uxTask, devTask, qaTask, decisionsByTaskId, releaseDecision = null) {
+    return workflowHelpers.deriveCurrentPhase(architectureTask, poTask, uxTask, devTask, qaTask, decisionsByTaskId, releaseDecision);
+  }
+
+
+  /**
+   * Recover the repo context (repoPath/branch/workingBranch) for a session.
+   * Read from the PipelineSession row — NOT scanned project-wide — so two
+   * sessions on the same project never pick up each other's working copy.
+   * Falls back to the legacy PO-task-observability lookup (pre-session data /
+   * the architecture-agent path that doesn't always create a session).
+   */
+  async _getRepoContext(projectId, sessionId = null) {
+    if (sessionId) {
+      const session = await PipelineSession.findById(sessionId);
+      if (session?.repoPath) {
+        return { repoPath: session.repoPath, workingBranch: session.workingBranch, baseBranch: session.baseBranch };
+      }
+      // FIX C — defensive fallback. Sessions created before this fix landed
+      // (or by a code path that didn't persist repoPath) would leave
+      // `_getRepoContext` returning null and the agents would lose the
+      // workspace. Look at any task in this session for `observability.repo`
+      // — workflowOrchestrator.runPOAgent:293-294 and runDEVAgent stash the
+      // repoContext on the task itself, which survives even if the
+      // PipelineSession row was created without repoPath.
+      if (typeof Task.findBySessionId === 'function') {
+        const sessionTasks = await Task.findBySessionId(sessionId).catch(() => []);
+        for (const t of sessionTasks) {
+          const repo = t.observability?.repo;
+          if (repo?.repoPath) return repo;
+        }
+      }
+    }
+    const poTasks = (await Task.findByProjectId(projectId)).filter((t) => t.type === 'po-agent' && !t.sessionId);
+    for (const t of poTasks) {
+      const repo = t.observability?.repo;
+      if (repo?.repoPath) return repo;
+    }
+    return null;
+  }
+
+  /**
+   * T2.3 — build the onGate callback for a task/role. Same shape as the real
+   * Claude Code `canUseTool`: async (toolName, input) => { behavior, ... }.
+   *   - AskUserQuestion (type B): pause for a human answer, return updatedInput.
+   *   - write/edit tools (type A): classify risk → auto allow | pause | deny.
+   * Every branch is audited.
+   */
+  _makeOnGate(taskId, role, { projectId = null, sessionId = null, scope = {} } = {}) {
+    return async (toolName, input = {}, options = {}) => claudePermissionDispatcher.dispatch({
+      toolName,
+      input,
+      options,
+      taskId,
+      sessionId,
+      projectId,
+      role,
+      scope,
+      audit: (entry) => this._recordGateAudit(taskId, entry),
+    });
+  }
+
+  /** Append an onGate audit entry (in-memory, surfaced by getAuditTrail). */
+  _recordGateAudit(taskId, entry) {
+    const list = GATE_AUDIT.get(taskId) || [];
+    list.push({ ...entry, timestamp: new Date().toISOString() });
+    GATE_AUDIT.set(taskId, list);
+    Task.findById(taskId)
+      .then(async (task) => {
+        if (!task) return;
+        // Build and publish the canonical envelope BEFORE persisting so the
+        // SSE fanout happens; then persist the AgentEvent row carrying the
+        // envelope for replay.
+        const envelope = await publishEvent('runtime_log',
+          { projectId: task.projectId, sessionId: task.sessionId, taskId, role: entry.role || null },
+          { level: 'info', source: 'audit', message: 'gate_audit', meta: { ...entry, timestamp: new Date().toISOString() } },
+        );
+        return AgentEvent.create({
+          taskId,
+          projectId: task.projectId,
+          sessionId: task.sessionId,
+          type: 'gate_audit',
+          actor: entry.role || 'orchestrator',
+          payload: entry,
+          envelope,
+          sequence: envelope.sequence,
+        });
+      })
+      .catch((error) => logger.warn('failed to persist gate audit event', { taskId, error: error.message }));
+    logger.info('gate_audit', { taskId, kind: entry.kind, role: entry.role, file: entry.file || null });
+  }
+
+  /** Read the onGate audit entries for a task (used by getAuditTrail). */
+  _getGateAudit(taskId) {
+    return GATE_AUDIT.get(taskId) || [];
   }
 
   async _requireApprovedTask(taskId, expectedType, user) {
     const task = await Task.findById(taskId);
     if (!task) throw new ApiError(404, 'Source task not found');
     if (user) await MembershipService.requireProjectRole(user.id, task.projectId, ['owner', 'admin', 'editor']);
-    if (task.type !== expectedType) throw new ApiError(400, `Source task must be type: ${expectedType}`);
+    // Scope the "pipeline locked on a question" check to this task's own
+    // session — otherwise a clarification question pending in one concurrent
+    // session would incorrectly block every other session on the project.
+    const scopeTaskIds = task.sessionId
+      ? new Set((await Task.findBySessionId(task.sessionId)).map((t) => t.id))
+      : null;
+    const pendingQuestion = this._getPendingQuestionGate(task.projectId, scopeTaskIds);
+    if (pendingQuestion) {
+      throw new ApiError(
+        409,
+        `Pipeline is locked while ${pendingQuestion.role} waits for a human answer`,
+        'PIPELINE_QUESTION_PENDING',
+        pendingQuestion.role,
+      );
+    }
+    const allowedTypes = Array.isArray(expectedType) ? expectedType : [expectedType];
+    if (!allowedTypes.includes(task.type)) throw new ApiError(400, `Source task must be type: ${allowedTypes.join(' | ')}`);
     if (task.status !== 'completed') throw new ApiError(400, 'Source task must be completed');
     if (task.versionStatus !== 'committed') {
       throw new ApiError(400, 'Source task must be approved (committed) before running next agent');
@@ -1570,115 +1612,33 @@ class SdlcWorkflowService {
     return task;
   }
 
+  _getPendingQuestionGate(projectId, taskIds = null) {
+    return gateManager.getPendingQuestionGate(projectId, taskIds);
+  }
+
   async _buildContextFromArtifacts(artifacts, extras = {}) {
-    const context = { ...extras };
-    for (const art of artifacts) {
-      if (!context[art.artifactType]) context[art.artifactType] = [];
-      const resolved = await resolveArtifactContent(art);
-      const content = resolved.contentText ?? resolved.contentJson ?? '';
-      context[art.artifactType].push({
-        key: art.artifactKey,
-        title: art.title,
-        content,
-      });
-    }
-    return context;
+    return artifactManager.buildContextFromArtifacts(artifacts, extras);
   }
 
   async _getFeatureRequestFromIntentTask(task) {
-    const featureArtifacts = await AgentArtifact.findByTaskIdAndType(task.id, 'feature_request');
-    if (featureArtifacts.length > 0) {
-      const resolved = await resolveArtifactContent(featureArtifacts[0]);
-      const featureRequest = resolved.contentJson || resolved.contentText;
-      if (featureRequest && typeof featureRequest === 'object' && featureRequest.title) {
-        return featureRequest;
-      }
-      if (typeof featureRequest === 'string' && featureRequest.trim()) {
-        return { title: 'Rework feature request', description: featureRequest };
-      }
-    }
-
-    const assumptions = await AgentArtifact.findByTaskIdAndType(task.id, 'intent_assumptions');
-    if (assumptions.length > 0) {
-      const resolved = await resolveArtifactContent(assumptions[0]);
-      if (resolved.contentText && resolved.contentText.trim()) {
-        return {
-          title: 'Rework feature request',
-          description: resolved.contentText,
-        };
-      }
-    }
-
-    throw new ApiError(400, 'Cannot rework intent task: original feature request artifact is missing');
+    const deps = { AgentArtifact, resolveArtifactContent };
+    return workflowHelpers.getFeatureRequestFromIntentTask(task, deps);
   }
 
   async _getFeatureRequestFromTask(task) {
-    const featureArtifacts = await AgentArtifact.findByTaskIdAndType(task.id, 'feature_request');
-    if (featureArtifacts.length > 0) {
-      const resolved = await resolveArtifactContent(featureArtifacts[0]);
-      if (resolved.contentJson?.title) return resolved.contentJson;
-    }
-    throw new ApiError(400, 'Cannot rework PO task: original feature request artifact is missing');
+    const deps = { AgentArtifact, resolveArtifactContent };
+    return workflowHelpers.getFeatureRequestFromTask(task, deps);
   }
 
   async _recordApprovedHandoff(task, approval) {
-    const nextAgent = NEXT_AGENT[task.type];
-    if (!nextAgent) return;
-
-    const artifacts = await AgentArtifact.findByTaskId(task.id);
-    const outputArtifacts = artifacts.filter((artifact) => artifact.artifactType !== 'a2a_handoff');
-    const envelope = {
-      handoff_id: uuidv4(),
-      schema_version: 'a2a_handoff.v1',
-      project_id: task.projectId,
-      from_agent: task.type,
-      to_agent: nextAgent,
-      source_task_id: task.id,
-      target_task_id: null,
-      attempt: (task.retryCount || 0) + 1,
-      input_artifacts: outputArtifacts.map((artifact) => ({ key: artifact.artifactKey, hash: artifact.contentHash })),
-      output_artifact: { task_id: task.id, hash: task.outputContentHash },
-      approval: {
-        approval_id: approval.id,
-        type: approval.action || approval.decision,
-        confidence: task.agentOutput?.confidence_score ?? null,
-        validation_result_id: `validation:${task.id}`,
-      },
-      contract: {
-        required_downstream_inputs: {
-          'ux-agent': ['prd', 'acceptance_criteria', 'risk_classification'],
-          'dev-agent': ['ux_spec', 'wireframe_spec', 'risk_classification'],
-          'qa-agent': ['patch_diff', 'sandbox_result', 'self_test_report', 'security_gate'],
-        }[nextAgent] || [],
-      },
-      integrity: {
-        artifact_hash: contentHash(outputArtifacts.map((artifact) => artifact.contentHash)),
-        created_at: new Date().toISOString(),
-      },
-      created_at: new Date().toISOString(),
-    };
-
-    await AgentArtifact.bulkUpsert([{
-      id: uuidv4(),
-      taskId: task.id,
-      projectId: task.projectId,
-      agentType: task.type,
-      artifactType: 'a2a_handoff',
-      artifactKey: `a2a_handoff:${task.id}:${nextAgent}`,
-      title: `${envelope.from_agent} to ${envelope.to_agent} Handoff`,
-      contentJson: envelope,
-      ordinal: 999,
-      contentHash: contentHash(envelope),
-    }]);
+    await artifactManager.recordApprovedHandoff(task, approval, {
+      nextAgentFn: (t) => this._nextAgentFor(t),
+      writeFileFn: (a, b, c, d) => this._writeArtifactToFile(a, b, c, d),
+    });
   }
 
   async _writeArtifactToFile(projectId, taskId, filename, content) {
-    const dir = path.join(WORKSPACE_DIR, projectId, taskId);
-    await fs.mkdir(dir, { recursive: true });
-    const filepath = path.join(dir, filename);
-    const data = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
-    await fs.writeFile(filepath, data, 'utf8');
-    return `FILE:${filepath}`;
+    return artifactManager.writeArtifactToFile(projectId, taskId, filename, content);
   }
 
   /**
@@ -1689,384 +1649,188 @@ class SdlcWorkflowService {
    * mock is held to the same output contract a real agent will be.
    */
   async _buildMockOutput(task, context) {
-    const mockDir = path.join(__dirname, '../../../mock-data', task.type);
-    const files = await fs.readdir(mockDir).catch(() => []);
-
-    const completedData = {
-      summary: "Mock execution completed via Hybrid Mock Mode.",
-      token_usage: { input: 1250, output: 450 },
-      observability: { trace_id: "mock-trace-123" }
+    // Delegate to agentDispatcher
+    const deps = {
+      classifyFeatureRequestFn: (fr) => classifyFeatureRequest(fr),
+      firstContextValueFn: (ctx, key) => firstContextValue(ctx, key),
     };
-
-    for (const file of files) {
-      if (!file.endsWith('.md') && !file.endsWith('.json')) continue;
-      const key = file.replace(/\.(md|json)$/, '');
-      const ext = path.extname(file);
-      const content = await fs.readFile(path.join(mockDir, file), 'utf8');
-      if (ext === '.json') {
-        // T4: a malformed mock file must surface a clear MOCK_PARSE_ERROR,
-        // not crash the loop or produce a half-built output.
-        try {
-          completedData[key] = JSON.parse(content);
-        } catch (parseErr) {
-          throw new ApiError(
-            500,
-            `Malformed mock JSON in ${task.type}/${file}: ${parseErr.message}`,
-            ERROR_CODES.MOCK_PARSE_ERROR,
-            `${task.type.replace('-agent', '').toUpperCase()}_RUNNING`,
-          );
-        }
-      } else {
-        completedData[key] = content;
-      }
-    }
-    if (['intent-agent', 'po-agent'].includes(task.type) && context.featureRequest) {
-      completedData.feature_request = context.featureRequest;
-    }
-    const feedbackPrompt = context.feedbackPrompt?.trim();
-    const inheritedRisk = firstContextValue(context, 'risk_classification');
-    const riskClassification = task.type === 'po-agent'
-      ? classifyFeatureRequest(context.featureRequest)
-      : (inheritedRisk || { level: 'LOW', tags: [], required_gates: ['schema', 'validation', 'evidence', 'qa'], classifier: 'mock-rule-based.v1' });
-    if (task.type !== 'intent-agent') {
-      completedData.risk_classification = riskClassification;
-      completedData.workflow_policy = {
-        auto_approve_threshold: AUTO_APPROVE_CONFIDENCE,
-        required_gates: riskClassification.required_gates,
-        max_retry_per_step: MAX_RETRY_PER_STEP,
-      };
-    }
-    if (task.type === 'dev-agent') {
-      completedData.patch_diff = completedData.mock_code_diff;
-      completedData.self_test_report = {
-        executed: true,
-        passed: completedData.sandbox_result?.tests_passed || 0,
-        failed: completedData.sandbox_result?.tests_failed || 0,
-        evidence: 'Mock sandbox run: npm test and npm run lint',
-      };
-      const securityRequired = riskClassification.required_gates.includes('security');
-      const securityPassed = !securityRequired || !!feedbackPrompt;
-      completedData.security_notes = securityPassed ? {
-        oauth_state_csrf: 'PASS',
-        pkce: 'PASS',
-        client_secret_frontend: 'PASS - no client secret is exposed',
-        redirect_uri_allow_list: 'PASS',
-        session_cookie: 'PASS - HttpOnly, Secure, SameSite=Lax',
-        account_linking: 'PASS',
-        logout_and_error_paths: 'PASS',
-        audit_logging: 'PASS',
-      } : null;
-      completedData.security_gate = securityPassed ? {
-        recommendation: 'PASS',
-        checklist_version: 'oauth-security.mock.v1',
-        issues: [],
-      } : {
-        recommendation: 'HOLD',
-        checklist_version: 'oauth-security.mock.v1',
-        issues: [{
-          code: 'oauth_state_csrf_missing',
-          severity: 'HIGH',
-          detail: 'Google OAuth callback evidence does not show state validation against the login session.',
-          expected_fix: 'Add state generation and callback validation, rerun sandbox tests, and attach the updated security notes.',
-        }],
-      };
-    }
-    if (task.type === 'qa-agent') {
-      completedData.ac_coverage_matrix = (completedData.ac_coverage_matrix || []).map((row) => ({
-        requirement_id: row.requirement_id || row.ac_id,
-        requirement: row.requirement || row.ac,
-        ux_covered: true,
-        dev_implemented: true,
-        test_exists: (row.test_case_ids || []).length > 0,
-        test_result: row.covered ? 'PASS' : 'FAIL',
-        evidence_ref: `DEV:${task.sourceRunId || 'approved'}:${firstContextValue(context, 'patch_diff') ? 'patch_diff' : 'mock_code_diff'}`,
-        ...row,
-      }));
-      completedData.coverage_summary = {
-        covered: completedData.ac_coverage_matrix.filter((row) => row.covered).length,
-        total: completedData.ac_coverage_matrix.length,
-        percentage: completedData.ac_coverage_matrix.length
-          ? Math.round((completedData.ac_coverage_matrix.filter((row) => row.covered).length / completedData.ac_coverage_matrix.length) * 100)
-          : 0,
-      };
-      completedData.dev_evidence_ref = {
-        task_id: task.sourceRunId,
-        patch_diff_present: !!firstContextValue(context, 'patch_diff'),
-        sandbox_result_present: !!firstContextValue(context, 'sandbox_result'),
-        security_gate: firstContextValue(context, 'security_gate'),
-      };
-    }
-    // T3: scenario-driven mock shaping (confidence + bad-case overrides),
-    // selected via the existing env mechanism (MOCK_SCENARIO / MOCK_LOW_CONFIDENCE_STAGE).
-    this._applyMockScenario(task, completedData, feedbackPrompt);
-    return completedData;
+    return agentDispatcher.buildMockOutput(task, context, deps);
   }
 
   /**
    * Core runner — calls AgentService and parses SSE stream, saves artifacts.
    * @private
    */
+  /**
+   * T3.4 — run a role via the claude-code path. Builds the onGate callback and
+   * repo target, then delegates artifact generation to the local Claude Code CLI.
+   */
+  async _runClaudeCodePath(task, context) {
+    const deps = {
+      getRepoContext: (pid, sid) => this._getRepoContext(pid, sid),
+      makeOnGate: (tid, role, opts) => this._makeOnGate(tid, role, opts),
+    };
+    return agentDispatcher.runClaudeCodePath(task, context, deps);
+  }
+
   async _runAgent(task, context, userId = null) {
-    await Task.update(task.id, { status: 'processing' });
-
-    // Hybrid Mock Mode Bypass
-    if (process.env.USE_MOCK_AGENTS === 'true') {
-      try {
-        console.log(`[SDLC] Running in MOCK mode for agent ${task.type}`);
-        const completedData = await this._buildMockOutput(task, context);
-
-        // Simulate processing delay
-        await new Promise(r => setTimeout(r, 2000));
-
-        await this._saveAgentData(task, completedData, userId);
-        return; // Bypass the real agent completely
-      } catch (err) {
-        console.error(`[SDLC._runAgent] Mock mode failed for task ${task.id}:`, err);
-        // T4: a malformed mock file is a demo-config error — fail the task
-        // clearly (with the MOCK_PARSE_ERROR code) instead of silently falling
-        // back to the real agent, which needs API keys and confuses the demo.
-        if (err.code === ERROR_CODES.MOCK_PARSE_ERROR) {
-          await this._markTaskFailed(task, err);
-          return;
-        }
-        // Otherwise fall back to the real agent.
-      }
-    }
-
-    try {
-      const response = await AgentService.runAgent({
-        sessionId: task.id,
-        nodeTarget: NODE_TARGET[task.type],
-        userId,
-        projectId: task.projectId,
-        context,
-      });
-
-      let buffer = '';
-      let completedData = null;
-      let agentError = null;
-
-      response.data.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        let currentEvent = null;
-
-        for (const line of lines) {
-          if (line.startsWith('event: ')) {
-            currentEvent = line.slice(7).trim();
-          } else if (line.startsWith('data: ') && currentEvent) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (currentEvent === 'error') {
-                agentError = data.message || 'Agent error';
-              } else if (currentEvent === 'completed') {
-                completedData = data;
-              }
-            } catch (_) {}
-          }
-        }
-      });
-
-      response.data.on('end', async () => {
-        try {
-          if (agentError) throw new Error(agentError);
-          if (!completedData) throw new Error('Agent returned no data');
-          if (['intent-agent', 'po-agent'].includes(task.type) && context.featureRequest) {
-            completedData.feature_request = context.featureRequest;
-          }
-
-          // I4: warn (non-fatal) if a real agent output diverges from the
-          // contract the mock satisfies. Surfaces drift the moment a real agent
-          // is wired, without blocking the run.
-          const conformance = assertOutputConforms(task.type, completedData);
-          if (!conformance.ok) {
-            logger.warn('agent output missing contract keys', {
-              taskId: task.id,
-              phase: task.type,
-              missing: conformance.missing,
-            });
-          }
-
-          await this._saveAgentData(task, completedData, userId);
-        } catch (err) {
-          console.error(`[SDLC._runAgent] Failed for task ${task.id}:`, err);
-          await this._markTaskFailed(task, err);
-        }
-      });
-
-      response.data.on('error', async (err) => {
-        await this._markTaskFailed(task, new Error(`Stream error: ${err.message}`));
-      });
-    } catch (err) {
-      await this._markTaskFailed(task, err);
-    }
+    const deps = {
+      saveAgentData: (t, d, uid) => this._saveAgentData(t, d, uid),
+      markTaskFailed: (t, err) => this._markTaskFailed(t, err),
+      handleTaskTimeout: (t) => this._handleTaskTimeout(t),
+      getRepoContext: (pid, sid) => this._getRepoContext(pid, sid),
+      makeOnGate: (tid, role, opts) => this._makeOnGate(tid, role, opts),
+      buildMockOutputFn: (t, c) => this._buildMockOutput(t, c),
+    };
+    return agentDispatcher.runAgent(task, context, userId, deps);
   }
 
   async _markTaskFailed(task, error) {
-    // T4: keep the structured error code visible in the persisted error so the
-    // SSE error event / UI can render a precise error state.
-    const errMsg = error.code ? `[${error.code}] ${error.message}` : error.message;
-    logger.error('task failed', { taskId: task.id, phase: task.type, code: error.code || null, error: error.message });
-    await Task.update(task.id, { status: 'failed', error: errMsg });
-    await FeatureBacklog.updateStatusByTaskId(task.id, 'TODO');
+    return agentDispatcher.markTaskFailed(task, error);
+  }
+
+  // Execution-time budget expired (excludes human gate waits). Move the task to a
+  // `timeout` terminal state so the workflow does not hang on a runaway agent.
+  async _handleTaskTimeout(task) {
+    return agentDispatcher.handleTaskTimeout(task);
   }
 
   /**
-   * T3: shape a mock agent output for a chosen demo scenario. Selected via the
-   * existing env mechanism (`MOCK_SCENARIO`, defaulting to `happy_path`).
-   * All overrides are deterministic so the
-   * preflight smoke test (T9) can assert the expected branch every run.
-   *
-   * Scenarios (each is a full PO→UX→DEV→QA run, the override fires on the
-   * relevant stage only):
-   *   - happy_path         : every stage high-confidence + valid → reaches Final Release.
-   *   - low_confidence_hold : target stage returns 0.58 → HOLD (human review).
-   *   - missing_evidence    : DEV drops sandbox test evidence → BLOCKER → INVALID, no handoff.
-   *   - qa_blocker          : QA reports a blocker + a failed test → QA gate fails, release LOCKED.
-   *   - release_reject      : outputs all pass; the smoke test rejects at the Final gate.
-   *   - escalation          : target stage stays at 0.58 even after feedback → repeated reject → escalation.
+   * Cancel a non-terminal task: unblock any pending gate, move it to `cancelled`,
+   * and release the worker lock. Idempotent guard returns 409 if already terminal.
+   */
+  async cancelTask({ taskId, reason = 'cancelled by user', user }) {
+    const task = await Task.findById(taskId);
+    if (!task) throw new ApiError(404, 'Task not found');
+    if (user) await MembershipService.requireProjectRole(user.id, task.projectId, ['owner', 'admin', 'editor']);
+    if (['completed', 'failed', 'cancelled', 'timeout'].includes(task.executionStatus)) {
+      throw new ApiError(409, `Task already ${task.executionStatus}`, 'TASK_TERMINAL');
+    }
+    // Resolve any pending gate so an in-flight run unblocks instead of hanging.
+    for (const gate of gateBridge.listPending({ taskId })) {
+      await gateBridge.resolveGate(gate.approvalId, { action: 'reject', cancelled: true, comment: reason }).catch(() => { });
+    }
+    await Task.update(taskId, { status: 'cancelled', error: reason, lockedBy: null, heartbeatAt: null });
+    await taskLifecycle.transitionIfPresent(taskId, 'cancelled', { actor: user ? 'human' : 'system', reason });
+    await FeatureBacklog.updateStatusByTaskId(taskId, 'TODO').catch(() => { });
+    await taskWorker.endRun(taskId);
+    logger.info('task cancelled', { taskId, phase: task.type, reason });
+    return { taskId, status: 'cancelled' };
+  }
+
+  // ── DMO-003: recover in-execution gates orphaned by a backend restart ──────
+  // A task left at `awaiting_gate` lost its in-memory continuation when the
+  // process died. Rather than make the user re-run the whole workflow, we
+  // re-dispatch ONLY that interrupted stage (prior committed stages are kept):
+  // the agent re-runs idempotently and raises a fresh gate the human can act on.
+
+  /** Rebuild the run context for an existing task from its persisted sources. */
+  async _rebuildContextForTask(task) {
+    const repoContext = await this._getRepoContext(task.projectId, task.sessionId);
+    const extras = repoContext ? { repoContext } : {};
+    const projectId = task.projectId;
+
+    if (task.type === 'po-agent') {
+      // Prefer the feature request persisted on the task (survives an interrupt
+      // before any artifact is saved); fall back to the saved artifact.
+      let featureRequest = task.observability?.featureRequest || null;
+      if (!featureRequest) {
+        featureRequest = await this._getFeatureRequestFromIntentTask(task).catch(() => null);
+      }
+      return this._buildContextFromArtifacts([], { ...extras, ...(featureRequest ? { featureRequest } : {}) });
+    }
+
+    const sourceTask = task.sourceRunId ? await Task.findById(task.sourceRunId) : null;
+
+    if (task.type === 'ux-agent') {
+      const sourceArtifacts = sourceTask ? await AgentArtifact.findByTaskId(sourceTask.id) : [];
+      return this._buildContextFromArtifacts(sourceArtifacts, extras);
+    }
+    if (task.type === 'dev-agent') {
+      const fromPo = sourceTask?.type === 'po-agent';
+      const poTask = fromPo ? sourceTask : await Task.findLatestByProject(projectId, 'po-agent', 'completed', 'committed');
+      const uxArtifacts = fromPo || !sourceTask ? [] : await AgentArtifact.findByTaskId(sourceTask.id);
+      const poArtifacts = poTask ? await AgentArtifact.findByTaskId(poTask.id) : [];
+      return this._buildContextFromArtifacts([...poArtifacts, ...uxArtifacts], extras);
+    }
+    if (task.type === 'qa-agent') {
+      const [poTask, uxTask] = await Promise.all([
+        Task.findLatestByProject(projectId, 'po-agent', 'completed', 'committed'),
+        Task.findLatestByProject(projectId, 'ux-agent', 'completed', 'committed'),
+      ]);
+      const all = (await Promise.all([
+        poTask ? AgentArtifact.findByTaskId(poTask.id) : Promise.resolve([]),
+        uxTask ? AgentArtifact.findByTaskId(uxTask.id) : Promise.resolve([]),
+        sourceTask ? AgentArtifact.findByTaskId(sourceTask.id) : Promise.resolve([]),
+      ])).flat();
+      return this._buildContextFromArtifacts(all, extras);
+    }
+    return this._buildContextFromArtifacts([], extras);
+  }
+
+  /** Re-run a single interrupted task's stage in place. Returns true if resumed. */
+  async _resumeInterruptedTask(task) {
+    if (task.executionStatus !== 'awaiting_gate') return false;
+    const context = await this._rebuildContextForTask(task);
+    // _runAgent transitions awaiting_gate -> running and re-drives the agent.
+    this._runAgent(task, context, null).catch((err) => console.error('[SDLC] resume failed:', err));
+    logger.warn('re-dispatched interrupted-gate stage', { taskId: task.id, phase: task.type });
+    return true;
+  }
+
+  /** Boot recovery: re-dispatch every task stuck at an interrupted gate. */
+  async recoverInterruptedGates() {
+    const tasks = await Task.listByExecutionStatus('awaiting_gate');
+    let resumed = 0;
+    for (const task of tasks) {
+      try {
+        if (await this._resumeInterruptedTask(task)) resumed += 1;
+      } catch (err) {
+        logger.warn('failed to resume interrupted task', { taskId: task.id, error: err.message });
+      }
+    }
+    return resumed;
+  }
+
+  /**
+   * Shape a deterministic mock agent output for the single demo scenario
+   * (`happy_path`): every stage is high-confidence + valid so the run reaches
+   * Final Release. Reviewer feedback (HITL reject → rework) is still honored so
+   * the human gate stays exercised. The synthetic bad-case scenarios of the old
+   * system have been removed; failure-handling can be reintroduced later.
    */
   _applyMockScenario(task, completedData, feedbackPrompt) {
-    const lowStage = MOCK_REVIEW_STAGES.includes(process.env.MOCK_LOW_CONFIDENCE_STAGE)
-      ? process.env.MOCK_LOW_CONFIDENCE_STAGE
-      : 'dev-agent';
-    const scenario = resolveMockScenario();
-    applyScenarioNarrative(task, completedData, scenario, feedbackPrompt);
-
-    const markRework = () => {
-      completedData.summary = `Mock ${task.type.replace('-agent', '').toUpperCase()} rework completed after applying reviewer feedback.`;
-      completedData.rework_response = {
-        worker: task.type,
-        feedback_received: feedbackPrompt,
-        changes_applied: [
-          `Revisited the ${task.type.replace('-agent', '').toUpperCase()} output using the reviewer direction.`,
-          'Regenerated the structured output and reran the applicable validation checks.',
-        ],
-        confidence_before: 0.58,
-        confidence_after: 0.92,
-      };
-    };
-
-    // Base confidence for the three review stages.
-    if (MOCK_REVIEW_STAGES.includes(task.type)) {
-      completedData.confidence_score = feedbackPrompt ? 0.92 : 0.95;
-      if (feedbackPrompt) markRework();
-    }
-
-    // DEV security passes in scenario mode so each branch isolates its own
-    // variable (confidence / evidence / QA / release).
-    if (task.type === 'dev-agent') {
-      completedData.security_notes = completedData.security_notes || {
-        oauth_state_csrf: 'PASS', pkce: 'PASS', client_secret_frontend: 'PASS',
-        redirect_uri_allow_list: 'PASS', session_cookie: 'PASS', account_linking: 'PASS',
-        logout_and_error_paths: 'PASS', audit_logging: 'PASS',
-      };
-      completedData.security_gate = { recommendation: 'PASS', checklist_version: 'oauth-security.mock.v1', issues: [] };
-    }
-
-    switch (scenario) {
-      case 'happy_path':
-        // every stage already high-confidence + valid; nothing to override.
-        break;
-
-      case 'low_confidence_hold':
-        if (task.type === lowStage && !feedbackPrompt) completedData.confidence_score = 0.58;
-        break;
-
-      case 'missing_evidence':
-        // DEV self-test / sandbox evidence is missing → _validateGateOutput BLOCKER.
-        if (task.type === 'dev-agent' && !feedbackPrompt) {
-          completedData.sandbox_result = { ...(completedData.sandbox_result || {}), tests_ran: false };
-          completedData.self_test_report = null;
-        } else if (task.type === 'dev-agent') {
-          completedData.sandbox_result = {
-            ...(completedData.sandbox_result || {}),
-            build_ok: true,
-            tests_ran: true,
-            tests_passed: Math.max(Number(completedData.sandbox_result?.tests_passed || 0), 12),
-            tests_failed: 0,
-          };
-          completedData.self_test_report = completedData.self_test_report || {
-            executed: true,
-            passed: completedData.sandbox_result.tests_passed,
-            failed: 0,
-            evidence: 'Reviewer-requested rerun: sandbox and self-test evidence attached.',
-          };
-          completedData.sandbox_report = `${completedData.sandbox_report || ''}\n\nReviewer feedback applied: sandbox execution and self-test evidence are now attached.`;
-        }
-        break;
-
-      case 'qa_blocker':
-        // QA finds a blocking defect and a failed test → QA gate fails, release locked.
-        if (task.type === 'qa-agent' && !feedbackPrompt) {
-          completedData.blocker_count = 2;
-          completedData.pass_count = Math.max(Number(completedData.pass_count || 0) - 1, 0);
-          completedData.fail_count = 1;
-          completedData.test_run_report = {
-            ...(completedData.test_run_report || {}),
-            executed: true,
-            passed: Math.max(Number(completedData.test_run_report?.passed || 0) - 1, 0),
-            failed: 1,
-            logs: 'Test runner: OAuth happy path passed, callback hardening failed. BLOCKER: CSRF state mismatch accepted in one regression case.',
-          };
-          completedData.qa_report = `${completedData.qa_report || ''}\n\nBLOCKER: OAuth callback accepted a mismatched state token in TC-015. Release is locked until DEV evidence is regenerated.`;
-          completedData.release_decision = 'LOCKED';
-          completedData.release_recommendation = 'DO_NOT_RELEASE';
-          completedData.release_reason = 'QA blocker: failed CSRF callback regression keeps the release gate locked.';
-        } else if (task.type === 'qa-agent') {
-          completedData.blocker_count = 0;
-          completedData.fail_count = 0;
-          completedData.pass_count = Number(completedData.test_run_report?.total || completedData.pass_count || 18);
-          completedData.test_run_report = {
-            ...(completedData.test_run_report || {}),
-            executed: true,
-            passed: Number(completedData.test_run_report?.total || completedData.pass_count || 18),
-            failed: 0,
-            logs: 'Reviewer-requested QA rerun: OAuth callback regression passed, blockers resolved.',
-          };
-          completedData.qa_report = `${completedData.qa_report || ''}\n\nREWORK VERIFIED: OAuth callback regression now rejects mismatched state tokens. No blockers remain.`;
-          completedData.release_decision = 'READY_FOR_REVIEW';
-          completedData.release_recommendation = 'RELEASE_WITH_REVIEW';
-          completedData.release_reason = 'QA rerun passed after blocker remediation; release can proceed to final review.';
-        }
-        break;
-
-      case 'release_reject':
-        // All agent outputs pass; the reject happens at the human Final gate (driven by the smoke test).
-        if (task.type === 'qa-agent') {
-          completedData.release_decision = 'READY_FOR_REVIEW';
-          completedData.release_recommendation = 'RELEASE_WITH_REVIEW';
-          completedData.release_reason = 'All automated gates pass; this branch expects the final human gate to reject the release packet.';
-        }
-        break;
-
-      case 'escalation':
-        // Target stage never recovers, even after reviewer feedback → repeated reject → escalation.
-        if (task.type === lowStage) {
-          completedData.confidence_score = 0.58;
-          delete completedData.rework_response;
-        }
-        break;
-
-      default:
-        break;
-    }
+    applyMockScenario(task, completedData, feedbackPrompt);
   }
 
   async _saveAgentData(task, completedData, userId) {
+    // Watchdog may have already moved this task to a terminal status
+    // (timeout/cancelled/failed) before the runner returned its output —
+    // _saveAgentData is invoked synchronously after the runner resolves
+    // regardless, so without this guard we'd attempt `transition(... ->
+    // 'completed')` from a terminal state and throw
+    // `Invalid task transition: <terminal> -> completed`. Bail out
+    // cleanly: the watchdog's markTaskFailed already recorded the
+    // terminal transition + audit event; nothing here can revive it.
+    if (['completed', 'failed', 'cancelled', 'timeout'].includes(task.executionStatus)) {
+      logger.warn('_saveAgentData skipped: task already terminal', {
+        taskId: task.id, executionStatus: task.executionStatus,
+      });
+      return null;
+    }
     // Save each artifact returned by the agent
     const artifactRows = [];
-    const artifactTypes = ['feature_request', 'scenario_brief', 'intent_assumptions', 'clarifying_questions',
+    const artifactTypes = ['feature_request', 'architecture_contract', 'clarifying_questions',
       'prd', 'user_stories', 'acceptance_criteria', 'scope', 'out_of_scope', 'mcp_activity',
-      'ux_spec', 'user_flow', 'wireframe_spec', 'component_inventory', 'screens',
+      'assumptions',
+      'ux_spec', 'user_flow', 'wireframe_spec', 'component_inventory', 'screens', 'html_mockup',
       'architecture_ledger_update', 'implementation_plan', 'mock_code_diff', 'changed_files',
-      'patch_diff', 'patch_format', 'linked_ac_ids', 'sandbox_result', 'self_test_report',
-      'risk_assessment', 'risk_level', 'sandbox_report', 'patch_branch', 'patch_commit',
+      'patch_diff', 'patch_format', 'linked_ac_ids', 'build_result', 'sandbox_result', 'self_test_report',
+      'risk_assessment', 'risk_level', 'build_report', 'patch_branch', 'patch_commit',
       'risk_classification', 'workflow_policy', 'security_notes', 'security_gate',
       'test_cases', 'qa_report', 'ac_coverage_matrix', 'pass_count', 'fail_count',
       'blocker_count', 'release_recommendation',
-      'test_run_report', 'regression_risks', 'security_findings', 'release_decision', 'release_reason',
+      'test_run_report', 'regression_risks', 'security_findings', 'release_reason',
       'coverage_summary', 'dev_evidence_ref',
       'confidence_score',
       'rework_response',
@@ -2129,6 +1893,7 @@ class SdlcWorkflowService {
           riskLevel: completedData.risk_level || 'LOW',
           mockCodeDiff,
           implementationPlan,
+          testRunReport: completedData.test_run_report || null,
         });
 
         completedData.gate_evaluation = gateResult;
@@ -2144,15 +1909,61 @@ class SdlcWorkflowService {
       }
     }
 
+    // -------------------------------------------------------------------------
+    // QA spec compliance (AIFA v2.1 §10): QA must NOT perform release approval.
+    // Phase 3.6: `release_decision` is no longer in QA's contract (Release
+    // Manager owns it). The `delete` line is no longer needed and was removed;
+    // we keep the gate-recommendation normalization so the persisted enum
+    // matches the Final Human Decision Gate's contract.
+    // -------------------------------------------------------------------------
+    if (task.type === 'qa-agent') {
+      const REC_MAP = { approve: 'PASS', needs_changes: 'PASS_WITH_RISK', reject: 'FAIL' };
+      if (completedData.gate_evaluation?.recommendation) {
+        const rec = String(completedData.gate_evaluation.recommendation).toLowerCase();
+        if (REC_MAP[rec]) {
+          completedData.gate_evaluation.recommendation = REC_MAP[rec];
+        }
+      }
+    }
+
     for (const artType of artifactTypes) {
       if (completedData[artType] !== undefined && completedData[artType] !== null) {
         const content = completedData[artType];
         let fileRef = null;
+        const ext = artType === 'html_mockup' ? 'html' : (typeof content === 'string' ? 'md' : 'json');
 
         if (typeof content === 'string') {
-          fileRef = await this._writeArtifactToFile(task.projectId, task.id, `${artType}.md`, content);
+          fileRef = await this._writeArtifactToFile(task.projectId, task.id, `${artType}.${ext}`, content);
         } else {
           fileRef = await this._writeArtifactToFile(task.projectId, task.id, `${artType}.json`, content);
+        }
+
+        // Architecture stage only: mirror `architecture_contract` into the
+        // cloned repo at `.aifa/architecture_contract.json` so the
+        // auto-commit on approve (`repoService.commitAndPushOnApprove`) has
+        // something to `git add`. Workspace artifact remains authoritative
+        // for pipeline consumers. Best-effort: a missing repo workspace
+        // (early failure, before clone) is logged and skipped — the
+        // workspace artifact still exists.
+        if (artType === 'architecture_contract' && task.sessionId) {
+          try {
+            const repoService = require('./repoService');
+            const sessionRepo = await repoService.getSessionRepoInfo({
+              projectId: task.projectId,
+              sessionId: task.sessionId,
+            }).catch(() => null);
+            if (sessionRepo?.repoPath) {
+              const mirrorDir = path.join(sessionRepo.repoPath, '.aifa');
+              await fs.mkdir(mirrorDir, { recursive: true });
+              const mirrorPath = path.join(mirrorDir, 'architecture_contract.json');
+              const mirrorData = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+              await fs.writeFile(mirrorPath, mirrorData, 'utf8');
+            }
+          } catch (mirrorErr) {
+            logger.warn('architecture_contract mirror into repo failed (non-fatal)', {
+              taskId: task.id, error: mirrorErr.message,
+            });
+          }
         }
 
         artifactRows.push({
@@ -2172,7 +1983,32 @@ class SdlcWorkflowService {
     }
 
     if (artifactRows.length > 0) {
-      await AgentArtifact.bulkUpsert(artifactRows);
+      // Guard against the task being deleted between agent completion and
+      // artifact persistence (project cleanup, retry racing, etc.). Without
+      // this check, AgentArtifact.create throws P2003 (FK violation) and the
+      // caller marks the task as failed even though the failure is purely
+      // cleanup-side.
+      const liveTask = await Task.findById(task.id).catch(() => null);
+      if (!liveTask) {
+        logger.warn('_saveAgentData: task vanished before bulkUpsert, skipping artifact persistence', {
+          taskId: task.id, agentType: task.type, artifactCount: artifactRows.length,
+        });
+        return { artifactCount: 0, agentType: task.type, skipped: 'task_not_found' };
+      }
+      try {
+        await AgentArtifact.bulkUpsert(artifactRows);
+      } catch (err) {
+        // Race: task was deleted after the guard above but before bulkUpsert
+        // committed. P2003 = foreign-key violation. Log and degrade gracefully
+        // so we don't double-mark the task as failed.
+        if (err?.code === 'P2003') {
+          logger.warn('_saveAgentData: P2003 on bulkUpsert (task deleted mid-flight), skipping', {
+            taskId: task.id, agentType: task.type, error: err.message,
+          });
+          return { artifactCount: 0, agentType: task.type, skipped: 'task_deleted_mid_flight' };
+        }
+        throw err;
+      }
     }
 
     // Build enriched result — include gate info for QA tasks
@@ -2189,15 +2025,44 @@ class SdlcWorkflowService {
     }
 
     const outputHash = contentHash(artifactRows.map((a) => a.contentHash));
+    // Merge observability with whatever the latest persisted task already holds
+    // so per-session state (e.g. featureRequest seeded by Architecture, repo
+    // context set by runAgent) survives subsequent agent completions. Each
+    // runner only returns its own slice (claude_result, etc.) and must not be
+    // allowed to wipe the previously-stored keys.
+    const liveTaskForObservability = await Task.findById(task.id).catch(() => null);
+    const observability = {
+      ...(liveTaskForObservability?.observability ?? {}),
+      ...(completedData.observability ?? {}),
+    };
+
+    // Spec §6.1 — clarification_questions is NOT a post-mortem JSON field.
+    // The runner's normalizeOutput() forces the field to [] before it reaches
+    // here, so no defensive branch is needed. Human clarification happens
+    // IN-FLIGHT via AskUserQuestion → claudePermissionDispatcher →
+    // gateBridge.requestGate, which pauses the SAME execution and resumes it
+    // in-place on resolve. There is exactly one canonical path; we no longer
+    // create a question gate here, rerun the agent, or create a new task.
+
     await Task.update(task.id, {
       status: 'completed',
       output_content_hash: outputHash,
       result: taskResult,
-      observability: completedData.observability || {},
+      observability,
       // Structured HITL (plan 2.4): keep the raw agent output distinct from the
       // human-approved output. approvedOutput is only set on approve/edit.
       agentOutput: completedData,
-      gateMode: DEFAULT_GATE_MODE[task.type] || GATE_MODE.STRICT_MANUAL,
+      gateMode: this._resolveGateMode(task),
+    });
+    // Race window: an execution-time timeout may have already moved this
+    // task to a terminal executionStatus (`timeout`) while the SDK was
+    // mid-flight and produced this output. Use `transitionIfPresent` so
+    // the "Invalid task transition: timeout -> completed" race is logged
+    // + skipped rather than crashing _saveAgentData and double-marking the
+    // task as failed downstream.
+    await taskLifecycle.transitionIfPresent(task.id, 'completed', {
+      actor: task.type,
+      payload: { outputHash },
     });
     await FeatureBacklog.updateStatusByTaskId(task.id, 'REVIEW');
 
@@ -2210,13 +2075,44 @@ class SdlcWorkflowService {
       .catch((e) => console.error('[SDLC] setStatusByTaskId failed:', e.message));
 
     if (blockers.length) {
-      logger.warn('agent output INVALID — no handoff, phase will not advance', {
+      logger.warn('agent output INVALID — opening output review gate with validation issues', {
         taskId: task.id,
         phase: task.type,
-        blockers: blockers.map((b) => b.rule),
+        blockers: blockers.map((b) => ({
+          rule: b.rule,
+          detail: b.detail,
+          ...(b.inspect ? { inspect: b.inspect } : {}),
+        })),
       });
-    } else {
-      await this._autoApproveSafeOutput(task.id, userId);
+    }
+
+    // Always create a human output-review gate for PO/UX/DEV/QA — the pipeline
+    // never silently auto-advances. Reject re-runs the same agent with the
+    // human's reason as feedback (see resolveOutputReviewGate).
+    if (AGENT_GATES[task.type]) {
+      const { approvalId } = gateBridge.requestGate({
+        taskId: task.id,
+        sessionId: task.sessionId,
+        projectId: task.projectId,
+        role: task.type,
+        kind: 'output_review',
+        payload: {
+          agent: task.type,
+          summary: completedData.summary || null,
+          artifacts: artifactRows.map((a) => a.artifactType),
+          validationIssues: blockers.map((b) => ({
+            rule: b.rule,
+            message: b.message || b.detail || null,
+            ...(b.inspect ? { inspect: b.inspect } : {}),
+          })),
+        },
+      });
+      logger.info('agent created output review gate', {
+        taskId: task.id,
+        agent: task.type,
+        approvalId,
+        invalid: blockers.length > 0,
+      });
     }
 
     if (userId) {
@@ -2227,8 +2123,23 @@ class SdlcWorkflowService {
         agentType: task.type,
         tokenInput: completedData.token_usage?.input || 0,
         tokenOutput: completedData.token_usage?.output || 0,
-      }).catch(() => {});
+      }).catch(() => { });
     }
+    await taskWorker.endRun(task.id); // DMO-001: terminal (completed) — release the worker lock
+  }
+
+  // Demo board review holds: force PARK roles to STRICT_MANUAL so a staged flow
+  // stops at that stage's review. Registered/cleared by demoBoardService.
+  setReviewHolds(projectId, roles = []) {
+    REVIEW_HOLDS.set(projectId, new Set(roles));
+  }
+
+  clearReviewHolds(projectId) {
+    REVIEW_HOLDS.delete(projectId);
+  }
+
+  _resolveGateMode(task) {
+    return workflowHelpers.resolveGateMode(task);
   }
 
   async _autoApproveSafeOutput(taskId, userId = null) {
@@ -2257,28 +2168,32 @@ class SdlcWorkflowService {
     });
     const refreshed = await Task.findById(task.id);
     await this._recordApprovedHandoff(refreshed, approval);
-    await this._startNextAgentIfAvailable(refreshed, userId);
+    try {
+      await this._startNextAgentIfAvailable(refreshed, userId);
+    } catch (err) {
+      // A downstream startup failure must not turn an already completed and
+      // committed upstream task into FAILED.
+      logger.error('downstream agent failed to start after auto-approval', {
+        sourceTaskId: refreshed.id,
+        sourceAgent: refreshed.type,
+        nextAgent: this._nextAgentFor(refreshed),
+        error: err.message,
+      });
+    }
     return true;
   }
 
   async _startNextAgentIfAvailable(task, userId = null) {
-    const nextAgent = NEXT_AGENT[task.type];
-    if (!nextAgent) return null;
-
-    const tasks = await Task.findByProjectId(task.projectId);
-    const existing = tasks.find((candidate) => candidate.type === nextAgent && candidate.sourceRunId === task.id);
-    if (existing) return existing;
-
-    const args = {
-      projectId: task.projectId,
-      sourceTaskId: task.id,
-      user: userId ? { id: userId } : null,
+    const deps = {
+      nextAgentFor: (t) => this._nextAgentFor(t),
+      getPendingQuestionGate: (pid, tids) => this._getPendingQuestionGate(pid, tids),
+      contentHash,
+      runAgent: (t, ctx, uid) => this._runAgent(t, ctx, uid),
+      requireApprovedTask: (tid, type, u) => this._requireApprovedTask(tid, type, u),
+      buildContextFromArtifacts: (arts, extras) => this._buildContextFromArtifacts(arts, extras),
+      MembershipService,
     };
-    if (nextAgent === 'po-agent') return this.runPOAgent(args);
-    if (nextAgent === 'ux-agent') return this.runUXAgent(args);
-    if (nextAgent === 'dev-agent') return this.runDEVAgent(args);
-    if (nextAgent === 'qa-agent') return this.runQAAgent(args);
-    return null;
+    return workflowOrchestrator.startNextAgentIfAvailable(task, userId, deps);
   }
 }
 

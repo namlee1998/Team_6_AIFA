@@ -5,9 +5,9 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js",
-    "admin:create": "node scripts/create_admin.js",
-    "demo:smoke": "node scripts/demoSmoke.js",
+    "dev": "prisma generate && nodemon src/server.js",
+    "demo:smoke": "node scripts/demoSmokeClaudeCode.js",
+    "demo:smoke:cc": "node scripts/demoSmokeClaudeCode.js",
     "test": "jest --runInBand"
   },
   "keywords": [],
@@ -15,19 +15,20 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.168",
     "@prisma/client": "^5.10.0",
-    "@supabase/supabase-js": "^2.45.0",
+    "@sentry/node": "^10.57.0",
+    "@sentry/profiling-node": "^10.57.0",
     "axios": "^1.16.0",
-    "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.1",
     "express": "^5.2.1",
-    "jsonwebtoken": "^9.0.3",
     "mammoth": "^1.12.0",
     "multer": "^2.1.1",
     "node-cron": "^4.2.1",
     "pdf-parse": "^2.4.5",
     "pino": "^9.14.0",
+    "socket.io": "^4.8.3",
     "uuid": "^14.0.0"
   },
   "devDependencies": {

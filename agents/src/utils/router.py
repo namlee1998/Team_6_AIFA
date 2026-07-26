@@ -28,12 +28,12 @@ def count_tokens(text: str) -> int:
 # Static Agent Configurations based on llm_strategy_report.md & Mentor Feedback
 AGENT_CONFIGS = {
     "intent_node": {"model": "gpt-4o-mini", "thinking": False, "max_tokens": 512, "temperature": 0.1},
-    "po_agent": {"model": os.getenv("PO_MODEL", "kr/claude-sonnet-4.5"), "thinking": False, "max_tokens": 8192, "temperature": 0.1},
-    "ux_agent": {"model": os.getenv("UX_MODEL", "gpt-4o"), "thinking": False, "max_tokens": 8192, "temperature": 0.1},
-    # Used only by the explicit local fallback. The v4 DEV path is Claude Agent SDK inside E2B.
-    "dev_agent": {"model": os.getenv("DEV_FALLBACK_MODEL", "kr/claude-sonnet-4.5"), "thinking": True, "max_tokens": 8192, "temperature": 0.0},
-    "qa_agent": {"model": os.getenv("QA_MODEL", "deepseek-v4-pro"), "thinking": False, "max_tokens": 4096, "temperature": 0.1},
-    "self_review": {"model": "deepseek-v4-pro", "thinking": False, "max_tokens": 2048, "temperature": 0.1}
+    "po_agent": {"model": os.getenv("PO_MODEL", "deepseek-chat"), "thinking": True, "max_tokens": 8192, "temperature": 0.1},
+    "ux_agent": {"model": os.getenv("UX_MODEL", "gemini-2.5-pro"), "thinking": False, "max_tokens": 8192, "temperature": 0.1},
+    # Config for the DEV agent
+    "dev_agent": {"model": os.getenv("DEV_FALLBACK_MODEL", "claude-3-5-sonnet-latest"), "thinking": False, "max_tokens": 8192, "temperature": 0.0},
+    "qa_agent": {"model": os.getenv("QA_MODEL", "grok-2-1212"), "thinking": False, "max_tokens": 4096, "temperature": 0.1},
+    "self_review": {"model": "deepseek-chat", "thinking": False, "max_tokens": 2048, "temperature": 0.1}
 }
 
 def get_agent_config(node_target: str, context_text: str = "") -> dict:

@@ -5,6 +5,15 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
+// Support both /api and /api/v1 prefixes by rewriting incoming URLs
+app.use((req, res, next) => {
+  console.log(`[Mock Server] ${req.method} ${req.url}`);
+  if (req.url.startsWith('/api/v1/')) {
+    req.url = req.url.replace('/api/v1/', '/api/');
+  }
+  next();
+});
+
 // ── In-Memory Database State ──────────────────────────────────────────────
 const projects = {
   'project-123': {
@@ -59,14 +68,68 @@ function getOrCreateProject(projectId) {
 }
 
 // ── Auth APIs ─────────────────────────────────────────────────────────────
-app.post('/api/auth/login', (req, res) => {
-  const { email } = req.body;
-  res.json({
+const makeMockSession = (email) => {
+  const user = {
+    id: 'mock-user-id',
+    email: email || 'dev@autonomous-factory.com',
+    user_metadata: {
+      company_name: 'Antigravity Tech Corp',
+      job_title: 'Lead Software Engineer'
+    }
+  };
+  return {
     session: {
       access_token: 'mock-jwt-token-123456789',
+      refresh_token: 'mock-refresh-token-123456789',
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      user
+    },
+    user
+  };
+};
+
+app.post('/api/auth/sign-in', (req, res) => {
+  const { email } = req.body;
+  res.json({
+    status: 'success',
+    data: makeMockSession(email)
+  });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const { email } = req.body;
+  res.json(makeMockSession(email));
+});
+
+app.post('/api/auth/sign-up', (req, res) => {
+  const { email } = req.body;
+  res.json({
+    status: 'success',
+    data: makeMockSession(email)
+  });
+});
+
+app.post('/api/auth/register', (req, res) => {
+  const { email } = req.body;
+  res.json(makeMockSession(email));
+});
+
+app.post('/api/auth/oauth-url', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      url: 'http://localhost:5173/sdlc'
+    }
+  });
+});
+
+app.get('/api/auth/me', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
       user: {
         id: 'mock-user-id',
-        email: email || 'dev@autonomous-factory.com',
+        email: 'dev@autonomous-factory.com',
         user_metadata: {
           company_name: 'Antigravity Tech Corp',
           job_title: 'Lead Software Engineer'
@@ -76,21 +139,16 @@ app.post('/api/auth/login', (req, res) => {
   });
 });
 
-app.post('/api/auth/register', (req, res) => {
-  const { email } = req.body;
-  res.json({
-    session: {
-      access_token: 'mock-jwt-token-123456789',
-      user: {
-        id: 'mock-user-id',
-        email: email || 'dev@autonomous-factory.com',
-        user_metadata: {
-          company_name: 'Antigravity Tech Corp',
-          job_title: 'Lead Software Engineer'
-        }
-      }
-    }
-  });
+app.post('/api/auth/sign-out', (req, res) => {
+  res.json({ status: 'success' });
+});
+
+app.post('/api/auth/reset-password', (req, res) => {
+  res.json({ status: 'success' });
+});
+
+app.post('/api/auth/update-password', (req, res) => {
+  res.json({ status: 'success' });
 });
 
 app.get('/api/profile', (req, res) => {
@@ -117,19 +175,319 @@ app.patch('/api/profile', (req, res) => {
   });
 });
 
-// ── Quota APIs ────────────────────────────────────────────────────────────
-app.get('/api/quota/summary', (req, res) => {
+// ── Quota API (Relative fallback used by frontend client) ─────────────────
+app.get('/api/quota', (req, res) => {
   res.json({
     status: 'success',
     data: {
-      total_tokens_used: 145920,
-      total_cost_usd: 1.46,
-      tier: 'Pro Sandbox',
-      daily_budget_usd: 15.00,
-      daily_spend_usd: 1.46
+      planId: 'pro-sandbox',
+      status: 'active',
+      creditsUsed: 146,
+      creditsTotal: 1500,
+      creditsRemaining: 1354,
+      periodStart: new Date().toISOString(),
+      periodEnd: null,
+      usage30d: {
+        tokenTotal: 145920,
+        creditsCharged: 146
+      }
     }
   });
 });
+
+// ── Document Tree & Document Management APIs ──────────────────────────────
+app.get('/api/tree', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      projects: Object.values(projects).map(p => ({
+        project_id: p.id,
+        name: p.name,
+        role: 'owner',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })),
+      folders: [
+        {
+          folder_id: 'folder-1',
+          project_id: 'project-123',
+          parent_id: null,
+          name: 'Tài liệu Yêu cầu',
+          sort_order: 1,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }
+      ],
+      documents: [
+        {
+          document_id: 'doc-1',
+          project_id: 'project-123',
+          folder_id: 'folder-1',
+          file_name: 'PRD_OnlineShopping.md',
+          file_type: 'markdown',
+          file_size: 2048,
+          status: 'processed',
+          created_at: new Date().toISOString()
+        }
+      ]
+    }
+  });
+});
+
+app.get('/api/invitations/mine', (req, res) => {
+  res.json({
+    status: 'success',
+    data: []
+  });
+});
+
+app.post('/api/invitations/accept', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      invitation_id: req.body.invitation_id || 'inv-123',
+      project_id: 'project-123',
+      project_name: 'Hệ thống Quản lý Bán hàng Online',
+      email: 'dev@autonomous-factory.com',
+      role: 'editor',
+      status: 'accepted',
+      invited_by: 'system',
+      expires_at: new Date().toISOString(),
+      created_at: new Date().toISOString()
+    }
+  });
+});
+
+app.get('/api/documents', (req, res) => {
+  res.json({
+    status: 'success',
+    data: [
+      {
+        document_id: 'doc-1',
+        project_id: 'project-123',
+        folder_id: 'folder-1',
+        file_name: 'PRD_OnlineShopping.md',
+        file_type: 'markdown',
+        file_size: 2048,
+        status: 'processed',
+        created_at: new Date().toISOString()
+      }
+    ],
+    total: 1
+  });
+});
+
+app.post('/api/documents/upload', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      document_id: `doc-${Date.now()}`,
+      file_name: 'tailieu_upload.md',
+      file_type: 'markdown'
+    }
+  });
+});
+
+app.get('/api/documents/:id', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      document_id: req.params.id,
+      project_id: 'project-123',
+      folder_id: 'folder-1',
+      file_name: 'PRD_OnlineShopping.md',
+      file_type: 'markdown',
+      file_size: 2048,
+      status: 'processed',
+      created_at: new Date().toISOString()
+    }
+  });
+});
+
+app.delete('/api/documents/:id', (req, res) => {
+  res.json({ status: 'success' });
+});
+
+app.patch('/api/documents/:id', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      document_id: req.params.id,
+      file_name: req.body.file_name || 'PRD_OnlineShopping.md',
+      file_type: 'markdown',
+      file_size: 2048,
+      status: 'processed',
+      created_at: new Date().toISOString()
+    }
+  });
+});
+
+app.patch('/api/documents/:id/move', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      document_id: req.params.id,
+      project_id: req.body.project_id || 'project-123',
+      folder_id: req.body.folder_id || 'folder-1',
+      file_name: 'PRD_OnlineShopping.md',
+      file_type: 'markdown',
+      file_size: 2048,
+      status: 'processed',
+      created_at: new Date().toISOString()
+    }
+  });
+});
+
+app.get('/api/documents/:id/preview', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      url: 'https://example.com/mock-preview-url',
+      file_type: 'markdown',
+      file_name: 'PRD_OnlineShopping.md'
+    }
+  });
+});
+
+app.get('/api/documents/:id/content', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      content: '# Product Requirements Document (PRD)\n\n## 1. Overview\nXây dựng website bán lẻ tích hợp thanh toán thẻ và giỏ hàng tự động.\n\n## 2. Requirements\n- R1: User phải đăng nhập được qua Google OAuth.\n- R2: Cập nhật trạng thái Kanban kéo thả ngay lập tức.\n- R3: Tích hợp cổng thanh toán Stripe.',
+      file_type: 'markdown',
+      file_name: 'PRD_OnlineShopping.md'
+    }
+  });
+});
+
+app.get('/api/folders', (req, res) => {
+  res.json({
+    status: 'success',
+    data: [
+      {
+        folder_id: 'folder-1',
+        project_id: 'project-123',
+        parent_id: null,
+        name: 'Tài liệu Yêu cầu',
+        sort_order: 1,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }
+    ]
+  });
+});
+
+app.post('/api/folders', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      folder_id: `folder-${Date.now()}`,
+      project_id: req.body.project_id || 'project-123',
+      parent_id: req.body.parent_id || null,
+      name: req.body.name || 'Thư mục mới',
+      sort_order: 2,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }
+  });
+});
+
+app.patch('/api/folders/:id', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      folder_id: req.params.id,
+      project_id: 'project-123',
+      parent_id: null,
+      name: req.body.name || 'Thư mục mới',
+      sort_order: 1,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }
+  });
+});
+
+app.patch('/api/folders/:id/move', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      folder_id: req.params.id,
+      project_id: req.body.project_id || 'project-123',
+      parent_id: req.body.parent_id || null,
+      name: 'Thư mục mới',
+      sort_order: req.body.sort_order || 1,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }
+  });
+});
+
+app.delete('/api/folders/:id', (req, res) => {
+  res.json({ status: 'success' });
+});
+
+// ── Session State & Workflow APIs ─────────────────────────────────────────
+app.delete('/api/sessions/:page', (req, res) => {
+  res.json({ status: 'success' });
+});
+
+app.post('/api/sessions/:page', (req, res) => {
+  res.json({
+    status: 'success',
+    data: {
+      id: 'session-123',
+      page: req.params.page,
+      selectedDocIds: [],
+      taskId: null,
+      metadata: {},
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+  });
+});
+
+app.get('/api/sessions/:page', (req, res) => {
+  res.json({
+    status: 'success',
+    data: null
+  });
+});
+
+app.get('/api/workflows/tasks', (req, res) => {
+  res.json({
+    status: 'success',
+    data: []
+  });
+});
+
+app.get('/api/workflows/latest/:documentId', (req, res) => {
+  res.json({
+    status: 'success',
+    data: null
+  });
+});
+
+app.get('/api/workflows/status/:taskId', (req, res) => {
+  res.json({
+    status: 'success',
+    data: null
+  });
+});
+
+app.get('/api/projects/:projectId/members', (req, res) => {
+  res.json({
+    status: 'success',
+    data: []
+  });
+});
+
+app.get('/api/projects/:projectId/invitations', (req, res) => {
+  res.json({
+    status: 'success',
+    data: []
+  });
+});
+
 
 // ── Project Management APIs ───────────────────────────────────────────────
 app.get('/api/projects', (req, res) => {
@@ -454,14 +812,71 @@ app.get('/api/sdlc/final-review-packet/:projectId', (req, res) => {
   res.json({
     status: 'success',
     data: {
-      projectId: p.id,
-      projectName: p.name,
-      released: p.released,
-      reviewPacket: {
-        prd: '# PRD Document\n\nRelease bundle generated.',
-        ux_spec: '# Wireframe Specs\n\nPenpot screens resolved.',
-        code_diff: 'diff --git a/src/App.tsx b/src/App.tsx\n+ // code changes'
-      }
+      phases: {
+        intent: { taskId: 'task-intent-123', status: 'completed', versionStatus: 'committed' },
+        po: { taskId: 'task-po-123', status: 'completed', versionStatus: 'committed' },
+        ux: { taskId: 'task-ux-123', status: 'completed', versionStatus: 'committed' },
+        dev: { taskId: 'task-dev-123', status: 'completed', versionStatus: 'committed' },
+        qa: { taskId: 'task-qa-123', status: 'completed', versionStatus: 'completed' }
+      },
+      artifacts: [
+        {
+          id: 'art-intent',
+          phase: 'po-agent',
+          type: 'prd',
+          title: 'Product Requirements Document (PRD)',
+          contentText: '# Product Requirements Document (PRD)\n\n## 1. Overview\nXây dựng website bán lẻ tích hợp thanh toán thẻ và giỏ hàng tự động.\n\n## 2. Requirements\n- R1: User phải đăng nhập được qua Google OAuth.\n- R2: Cập nhật trạng thái Kanban kéo thả ngay lập tức.\n- R3: Tích hợp Stripe.',
+          contentJson: null
+        },
+        {
+          id: 'art-ux',
+          phase: 'ux-agent',
+          type: 'ux_spec',
+          title: 'UX/UI Wireframe Spec',
+          contentText: '# UX/UI Spec\n\nPenpot screens resolved.',
+          contentJson: null
+        },
+        {
+          id: 'art-dev',
+          phase: 'dev-agent',
+          type: 'implementation_plan',
+          title: 'Implementation Plan',
+          contentText: '# DEV Plan\n\n- [x] Setup database schemas\n- [x] Configure router and controllers',
+          contentJson: null
+        },
+        {
+          id: 'art-qa',
+          phase: 'qa-agent',
+          type: 'test_cases',
+          title: 'Vitest Unit Test Cases',
+          contentText: '# QA Testcases\n\n- [x] test("renders KanbanBoard")',
+          contentJson: null
+        }
+      ],
+      hitlDecisions: [
+        {
+          id: 'hitl-1',
+          gate: 'REQUIREMENT_GATE',
+          decision: 'APPROVE',
+          comment: 'Yêu cầu được phân tích rất rõ ràng, đồng ý thông qua.',
+          createdAt: new Date().toISOString()
+        },
+        {
+          id: 'hitl-2',
+          gate: 'UX_GATE',
+          decision: 'APPROVE',
+          comment: 'Wireframe thiết kế Penpot trực quan, bố cục tốt.',
+          createdAt: new Date().toISOString()
+        },
+        {
+          id: 'hitl-3',
+          gate: 'DEV_GATE',
+          decision: 'APPROVE',
+          comment: 'Mã nguồn viết sạch sẽ, tuân thủ quy tắc bảo mật.',
+          createdAt: new Date().toISOString()
+        }
+      ],
+      generatedAt: new Date().toISOString()
     }
   });
 });

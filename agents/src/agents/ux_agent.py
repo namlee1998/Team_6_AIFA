@@ -1,6 +1,7 @@
-"""
-UX Agent — Generates UX Spec, User Flow, Wireframe Spec and Component Inventory
-from approved PRD + User Stories.
+"""UX worker: turn approved product artifacts into design artifacts.
+
+Beginner reading guide: this module owns prompt/model/parsing concerns only.
+The Node orchestrator supplies approved upstream context and controls handoff.
 """
 from __future__ import annotations
 import json
@@ -36,16 +37,7 @@ Output ONLY valid JSON with keys: ux_spec, user_flow, wireframe_spec, component_
 No extra text outside the JSON.
 """
 
-def _get_llm(model_config: dict | None = None) -> ChatOpenAI:
-    model_config = model_config or {}
-    model_name = model_config.get("model") or os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
-    return ChatOpenAI(
-        model=model_name,
-        temperature=model_config.get("temperature", 0.2),
-        max_tokens=model_config.get("max_tokens", 8192),
-        api_key=os.getenv("OPENAI_API_KEY", ""),
-        base_url=os.getenv("OPENAI_API_BASE") or None,
-    )
+from src.utils.llm_factory import get_llm as _get_llm
 
 def _parse_output(raw: str) -> dict:
     text = raw.strip()
@@ -54,9 +46,8 @@ def _parse_output(raw: str) -> dict:
         text = fence.group(1).strip()
     try:
         return json.loads(text)
-    except Exception:
-        logger.warning("[UXAgent] Failed to parse JSON")
-        return {"ux_spec": raw, "user_flow": "", "wireframe_spec": "", "component_inventory": "", "screens": [], "summary": ""}
+    except Exception as e:
+        raise ValueError(f"Agent generated invalid JSON: {str(e)}\nRaw output: {raw}")
 
 async def run_ux_agent(
     input_data: UXAgentInput,
@@ -73,6 +64,8 @@ async def run_ux_agent(
         user_content += f"Acceptance Criteria:\n" + "\n".join([f"- {ac}" for ac in input_data.acceptance_criteria])
     if input_data.feedback_prompt:
         user_content = f"<human_feedback>\n{input_data.feedback_prompt}\n</human_feedback>\n\n{user_content}"
+    if input_data.previous_draft:
+        user_content += f"\n\n<previous_draft>\n{input_data.previous_draft}\n</previous_draft>\n<instruction>\nYou MUST use the previous_draft as your baseline. Only apply changes requested in the human_feedback. Do not rewrite perfectly good sections unnecessarily.\n</instruction>"
 
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=user_content)]
     config = trace_context.langchain_config("ux_agent") if trace_context else None
@@ -102,6 +95,8 @@ async def stream_ux_agent(
         user_content += f"User Stories:\n{stories_text}\n"
     if input_data.feedback_prompt:
         user_content = f"<human_feedback>\n{input_data.feedback_prompt}\n</human_feedback>\n\n{user_content}"
+    if input_data.previous_draft:
+        user_content += f"\n\n<previous_draft>\n{input_data.previous_draft}\n</previous_draft>\n<instruction>\nYou MUST use the previous_draft as your baseline. Only apply changes requested in the human_feedback. Do not rewrite perfectly good sections unnecessarily.\n</instruction>"
 
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=user_content)]
     config = trace_context.langchain_config("ux_agent") if trace_context else None

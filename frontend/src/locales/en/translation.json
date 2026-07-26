@@ -1,104 +1,4 @@
 {
-  "landing": {
-    "titleMain": "Stop writing tests",
-    "titleHighlight": "manually.",
-    "subtitleMain": "Upload your PRD and User Flow documents. Our AI pipeline of 3 specialized agents reads, designs, and generates",
-    "subtitleHighlight": "production-ready AutoMobile YAML test scripts",
-    "subtitleEnd": "— in seconds.",
-    "startBtn": "Start Generating Tests",
-    "howItWorksBtn": "See How It Works",
-    "badgeAI": "Multi-Agent AI · PRD → Testcase → YAML",
-    "stats": {
-      "agents": "AI Agents",
-      "time": "Per test case",
-      "spec": "AutoMobile spec",
-      "effort": "Manual effort"
-    },
-    "pipeline": {
-      "tag": "The Pipeline",
-      "title": "How It Works",
-      "subtitle": "Three specialized agents work in sequence — each with a single, clearly defined responsibility.",
-      "flowInput": "Input: PRD + User Flow + UI Description",
-      "flowOutput": "Output: AutoMobile YAML Test Files",
-      "agent1": {
-        "title": "Flow Normalization",
-        "desc": "Reads PRD + User Flow documents. Extracts and normalizes all flows into clear, machine-readable structure."
-      },
-      "agent2": {
-        "title": "Scenario Design",
-        "desc": "Acts as your Senior QA. Designs Happy path, Negative, Edge, and Validation cases from each normalized flow."
-      },
-      "agent3": {
-        "title": "YAML Generation",
-        "desc": "Translates every test scenario into a complete, ready-to-run AutoMobile YAML file with real UI selectors."
-      }
-    },
-    "documents": {
-      "tag": "What You Bring",
-      "title": "3 Documents. That’s it.",
-      "subtitle": "No code. No config. Just upload your existing project documents and let the agents do the rest.",
-      "prd": {
-        "title": "PRD — Product Requirements",
-        "desc": "Describes features, business logic, input/output rules. The source of truth for what the app should do."
-      },
-      "flow": {
-        "title": "User Flow Document",
-        "desc": "Step-by-step user behavior sequences. Describes how users interact with each screen and feature."
-      },
-      "ui": {
-        "title": "UI Description",
-        "desc": "Details every UI component on each screen — element IDs, labels, states. Agent 3 uses this to map selectors."
-      }
-    },
-    "demo": {
-      "tag": "Live Example",
-      "title": "See the transformation",
-      "subtitle": "From human-readable spec ↔ executable YAML — automatically.",
-      "terminal": "aidlc-platform / pipeline demo",
-      "inputTag": "INPUT",
-      "outputTag": "OUTPUT",
-      "aiGenerated": "AI Generated"
-    },
-    "enterprise": {
-      "tag": "Why Teams Choose Us",
-      "title": "Enterprise-grade traceability,\nwithout the overhead.",
-      "feature1": "End-to-end pipeline: PRD → Normalized Flow → Test Scenario → YAML",
-      "feature2": "Human-in-the-loop review gates at every agent handoff",
-      "feature3": "Cascade invalidation — re-run Agent 1 and downstream auto-updates",
-      "feature4": "Full traceability: any YAML step traces back to its source requirement",
-      "feature5": "Supports Happy path, Negative, Edge, Validation & Business rule cases",
-      "miniPipeline": {
-        "step1": "PRD + User Flow",
-        "step2": "Agent 1 → Normalized Flows",
-        "step3": "Agent 2 → Test Scenarios",
-        "step4": "Agent 3 → AutoMobile YAML",
-        "tags": {
-          "input": "Input",
-          "processing": "Processing",
-          "output": "Output"
-        }
-      }
-    },
-    "cta": {
-      "ready": "READY?",
-      "title": "Automate your QA pipeline today.",
-      "subtitle": "Stop spending weeks writing test scripts by hand. Let 3 AI agents do it in seconds — consistently, every time.",
-      "startBtn": "Start for Free"
-    },
-    "footer": {
-      "copyright": "© 2026 AIDLC Control Platform. Developed by Team 6.",
-      "docs": "Docs",
-      "architecture": "Architecture",
-      "signIn": "Sign In"
-    }
-  },
-  "nav": {
-    "title": "AIDLC Platform",
-    "badge": "AI-Powered",
-    "signIn": "Sign In",
-    "goToApp": "Go to App",
-    "getStarted": "Get Started"
-  },
   "notFound": {
     "eyebrow": "404 - Page not found",
     "title": "This route is off the map",
@@ -124,5 +24,120 @@
     "running": "Processing...",
     "completed": "Completed",
     "failed": "Failed"
+  },
+  "common": {
+    "confirm": "Confirm",
+    "cancel": "Cancel",
+    "other": "Other",
+    "loading": "Loading...",
+    "search": "Search",
+    "delete": "Delete",
+    "refresh": "Refresh"
+  },
+  "errorBoundary": {
+    "title": "Application Runtime Error",
+    "description": "An unexpected crash occurred in the application view rendering. You can try refreshing the page or navigating back.",
+    "reload": "Reload Application",
+    "goDashboard": "Go to Dashboard",
+    "technicalLog": "TECHNICAL ERROR LOG",
+    "show": "Show",
+    "hide": "Hide"
+  },
+  "emptyProject": {
+    "welcome": "Welcome to Autonomous Factory",
+    "desc": "Start by selecting or creating a project, then describe the feature you want to build. The system will guide you through each AI agent and human approval gates.",
+    "step1": "1. Create your first project",
+    "step2": "2. Select 'New Feature Request' and describe requirements",
+    "step3": "3. Run the PO Agent from the backlog tab",
+    "step4": "4. Approve results to unlock the next agent",
+    "btnCreate": "Create your first project"
+  },
+  "kanban": {
+    "selectProject": "Please select a project to view the Kanban board.",
+    "noCards": "No cards yet",
+    "workspace": "Workspace",
+    "title": "Feature Backlog",
+    "desc": "Create a request, then start the autonomous delivery pipeline.",
+    "newRequest": "New Feature Request",
+    "refresh": "Refresh backlog",
+    "startFirst": "Start by creating your first Feature Request",
+    "appearTodo": "It will appear in To Do, ready for PO Agent.",
+    "readyStart": "Ready to start the pipeline",
+    "clickStart": "Click Start PO Agent on a card in the To Do column."
+  },
+  "artifact": {
+    "all": "All",
+    "noArtifacts": "No artifacts yet. Run an agent to generate output.",
+    "placeholder": "Select an artifact to view its content",
+    "editGroom": "Edit / Groom",
+    "saveApprove": "Save & Approve Gate"
+  },
+  "audit": {
+    "emptyTitle": "No audit trail history yet",
+    "emptyDesc": "Run an Agent or perform human review to see the timeline.",
+    "filterRole": "Filter by role:",
+    "all": "All",
+    "eventType": "Event type:",
+    "noEvents": "No events found matching the selected filters.",
+    "qualityReviewed": "Quality reviewed:",
+    "attempt": "attempt",
+    "blockingIssues": "blocking issue",
+    "blockingIssuesPlural": "blocking issues",
+    "decisionApprove": "Approve",
+    "decisionReject": "Reject",
+    "decisionRework": "Request Rework",
+    "hitlGate": "HITL Gate"
+  },
+  "layout": {
+    "newFeatureRequest": "New Feature Request",
+    "chooseProjectFirst": "Please select a project from the sidebar first",
+    "projectsTitle": "Projects",
+    "createProject": "Import local folder",
+    "workspace": "Workspace",
+    "noProjects": "No projects yet",
+    "createProjectBtn": "Import Project",
+    "cancel": "Cancel",
+    "creating": "Importing...",
+    "createProjectTitle": "Import Project from Local Folder",
+    "projectNameLabel": "Local Folder Path",
+    "projectNamePlaceholder": "Enter absolute local folder path (e.g., C:\\Projects\\my-project)...",
+    "createProjectFailed": "Failed to import project",
+    "deleteProjectConfirm": "Delete project?",
+    "deleteProjectDesc": "This permanently deletes {name} and its workflow data.",
+    "confirmDeleteBtn": "Delete project",
+    "deleting": "Deleting...",
+    "projectActionDeleted": "Deleted \"{name}\".",
+    "projectActionDeleteFailed": "Could not delete project.",
+    "searchPlaceholder": "Search projects & assets...",
+    "expand": "Expand",
+    "collapse": "Collapse"
+  },
+  "dashboard": {
+    "workspace": "AIDLC delivery workspace",
+    "title": "Build a feature with four AI workers",
+    "subtitle": "Submit once to PO. Workers continue automatically and pause only when human direction is needed.",
+    "build": "Build",
+    "audit": "Audit",
+    "newRequest": "New feature request",
+    "loadError": "Could not load the delivery workflow.",
+    "executionFailed": "Agent execution failed.",
+    "sendFailed": "Could not send the feature request to PO Agent.",
+    "openGateFailed": "Could not open the human review output."
+  },
+  "hitl": {
+    "title": "Intervention Center",
+    "totalPending": "Total Pending",
+    "securityRisks": "Security Risks",
+    "poQuestions": "PO Questions",
+    "avgResolution": "Avg Resolution",
+    "navigateResolve": "Navigate to Resolve",
+    "emptyState": "All clear! No pending interventions.",
+    "errorFetch": "Failed to load interventions",
+    "retry": "Retry",
+    "timelineTitle": "Audit Logs & Override Events",
+    "projectLabel": "Project:",
+    "typeLabel": "Type:",
+    "phaseLabel": "Phase:",
+    "contextBtn": "View Context"
   }
 }

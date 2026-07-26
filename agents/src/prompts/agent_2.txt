@@ -124,8 +124,8 @@ Rules:
   Incorrect: file_format: "an unsupported image format"
 
 - If a value cannot be expressed as a literal because the document does not specify it,
-  use the TODO placeholder pattern:
-  field_name: "TODO: confirm [what is needed] with dev team"
+  use the PENDING_CLARIFICATION placeholder pattern:
+  field_name: "PENDING_CLARIFICATION: confirm [what is needed] with dev team"
 </test_data_rule>
 
 <missing_information_rule>
@@ -140,8 +140,8 @@ assert_hints — strict format:
   (B) Navigation state (no text involved):
         "User is on [screen name]"
         "User remains on [active_screen]"
-  (C) TODO when exact text is NOT in any document:
-        "TODO: exact [success/error] text not in documents — confirm with dev team"
+  (C) PENDING_CLARIFICATION when exact text is NOT in any document:
+        "PENDING_CLARIFICATION: exact [success/error] text not in documents — confirm with dev team"
 
   FORBIDDEN in assert_hints — these are not valid hints:
     "Error message is visible"           ← vague, not verifiable
@@ -151,10 +151,10 @@ assert_hints — strict format:
   If you cannot write form (A) because exact text is unknown, write form (C).
 
 test_data — when value is unknown:
-    field_name: "TODO: confirm [what is needed] with dev team"
+    field_name: "PENDING_CLARIFICATION: confirm [what is needed] with dev team"
 
 expected_outcome — when exact UI text is unknown:
-    End the sentence with "(exact UI text: TODO — confirm with dev team)"
+    End the sentence with "(exact UI text: PENDING_CLARIFICATION — confirm with dev team)"
 
 This rule applies to:
 - Error messages not specified in PRD or UI_DESCRIPTION
@@ -199,7 +199,7 @@ assert_hints — how to populate:
     - Look up the matching error_signal by trigger.
     - If ui_text is a non-null string: use it as the hint verbatim.
     - If ui_text is null: apply the missing_information_rule —
-      "TODO: exact error text not in documents — confirm with dev team"
+      "PENDING_CLARIFICATION: exact error text not in documents — confirm with dev team"
     - Always add a hint about element state if known: "[element] shows validation state"
     - Always add a hint confirming the user did NOT navigate away:
       "User remains on [active_screen]"

@@ -1,8 +1,0 @@
-[
-  { "path": "src/auth/googleAuth.js", "reason": "Service xác minh ID token Google và tìm/tạo người dùng", "change_type": "add" },
-  { "path": "src/routes/authGoogle.js", "reason": "Route khởi tạo luồng Google và xử lý callback", "change_type": "add" },
-  { "path": "tests/googleAuth.test.js", "reason": "Unit test cho verifyGoogleToken và findOrCreateGoogleUser", "change_type": "add" },
-  { "path": "frontend/src/components/GoogleSignInButton.tsx", "reason": "Nút Sign in with Google trên màn hình đăng nhập", "change_type": "add" },
-  { "path": "src/routes/index.js", "reason": "Đăng ký router auth Google vào app", "change_type": "modify" },
-  { "path": ".env.example", "reason": "Bổ sung biến môi trường GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI", "change_type": "modify" }
-]

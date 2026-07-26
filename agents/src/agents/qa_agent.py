@@ -1,5 +1,8 @@
-"""
-QA Agent — Test Cases, QA Report, AC Coverage Matrix from all upstream artifacts.
+"""QA worker: turn approved upstream evidence into test and release artifacts.
+
+Beginner reading guide: _build_qa_content limits and organizes upstream context,
+the model produces structured QA evidence, and the Node backend applies the
+authoritative quality/release gates.
 """
 from __future__ import annotations
 import json, logging, os, re
@@ -16,7 +19,9 @@ SYSTEM_PROMPT = """You are a senior QA Engineer. Your mission is to generate tes
 Given: PRD, Acceptance Criteria (AC) list, UX Spec, Implementation Plan, Code Diff, Sandbox Report, Risk Assessment.
 
 === OUTPUT (strict JSON) ===
-{test_cases, qa_report, ac_coverage_matrix, pass_count, fail_count, blocker_count, release_recommendation, summary}
+{test_cases, qa_report, ac_coverage_matrix, test_run_report, regression_risks,
+security_findings, release_decision, release_reason, pass_count, fail_count,
+blocker_count, release_recommendation, summary}
 
 === TEST CASE RULES ===
 
@@ -38,7 +43,7 @@ Given: PRD, Acceptance Criteria (AC) list, UX Spec, Implementation Plan, Code Di
    - expected_result must describe EXACTLY what happens — not "success message appears" but "Toast shows 'Login successful' and user is redirected to /dashboard"
    - precondition must list full app state: auth state, screen, data, feature flags
    - test_data must use LITERAL values (not "a valid email" but "user@example.com")
-   - If exact text is unknown from documents: use "TODO: confirm exact text with dev"
+   - If exact text is unknown from documents: use "PENDING_CLARIFICATION: confirm exact text with dev"
 
 5. REAL BUG COVERAGE — think about these real failure scenarios:
    - What if the network call fails? (timeout, 500 error)
@@ -77,35 +82,16 @@ covered=false only when zero test cases exist for that AC.
 
 Output ONLY valid JSON. No markdown fences."""
 
-def _get_llm(model_config=None):
-    if model_config is None:
-        model_config = {}
-        
-    model_name = model_config.get("model") or os.getenv("DEFAULT_MODEL", "deepseek-v4-pro")
-    temp = model_config.get("temperature", 0.1)
-    max_tokens = model_config.get("max_tokens", 8192)
-    thinking = model_config.get("thinking", False)
-    
-    kwargs = {
-        "model": model_name,
-        "temperature": temp,
-        "max_tokens": max_tokens,
-        "api_key": os.getenv("OPENAI_API_KEY", ""),
-        "base_url": os.getenv("OPENAI_API_BASE") or None
-    }
-    
-    if thinking:
-        kwargs["model_kwargs"] = {"extra_body": {"thinking": True}}
-        
-    return ChatOpenAI(**kwargs)
+from src.utils.llm_factory import get_llm as _get_llm
 
 def _parse(raw):
     text = raw.strip()
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fence: text = fence.group(1).strip()
-    try: return json.loads(text)
-    except: return {"test_cases":[], "qa_report": raw, "ac_coverage_matrix":[], "pass_count":0,
-                    "fail_count":0, "blocker_count":0, "release_recommendation":"HOLD", "summary":""}
+    try:
+        return json.loads(text)
+    except Exception as exc:
+        raise ValueError(f"QA agent generated invalid JSON: {exc}\nRaw output: {raw}") from exc
 
 def _build_qa_content(input_data: QAAgentInput) -> str:
     """Build the human message content for QA Agent from all input artifacts."""
@@ -140,6 +126,9 @@ def _build_qa_content(input_data: QAAgentInput) -> str:
     if input_data.feedback_prompt:
         content = f"<human_feedback>\n{input_data.feedback_prompt}\n</human_feedback>\n\n" + content
 
+    if input_data.previous_draft:
+        content += f"\n\n<previous_draft>\n{input_data.previous_draft}\n</previous_draft>\n<instruction>\nYou MUST use the previous_draft as your baseline. Only apply changes requested in the human_feedback. Do not rewrite perfectly good sections unnecessarily.\n</instruction>"
+
     return content
 
 
@@ -152,11 +141,21 @@ async def run_qa_agent(input_data: QAAgentInput, model_config=None, trace_contex
     p = _parse(resp.content)
     test_cases = [QATestCase(**t) if isinstance(t, dict) else t for t in p.get("test_cases", [])]
     matrix = [ACCoverageRow(**r) if isinstance(r, dict) else r for r in p.get("ac_coverage_matrix", [])]
-    return QAAgentOutput(test_cases=test_cases, qa_report=p.get("qa_report",""),
-                         ac_coverage_matrix=matrix, pass_count=p.get("pass_count",0),
-                         fail_count=p.get("fail_count",0), blocker_count=p.get("blocker_count",0),
-                         release_recommendation=p.get("release_recommendation","HOLD"),
-                         summary=p.get("summary","QA Agent completed"))
+    return QAAgentOutput(
+        test_cases=test_cases,
+        qa_report=p.get("qa_report", ""),
+        ac_coverage_matrix=matrix,
+        test_run_report=p.get("test_run_report", {}),
+        regression_risks=p.get("regression_risks", []),
+        security_findings=p.get("security_findings", []),
+        release_decision=p.get("release_decision", "needs_changes"),
+        release_reason=p.get("release_reason", ""),
+        pass_count=p.get("pass_count", 0),
+        fail_count=p.get("fail_count", 0),
+        blocker_count=p.get("blocker_count", 0),
+        release_recommendation=p.get("release_recommendation", "HOLD"),
+        summary=p.get("summary", "QA Agent completed"),
+    )
 
 async def stream_qa_agent(input_data: QAAgentInput, model_config=None, trace_context=None):
     llm = _get_llm(model_config)

@@ -1,6 +1,71 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/react';
-import { afterEach, vi } from 'vitest';
+import { afterEach, vi, expect } from 'vitest';
+import enTranslations from '../src/locales/en/translation.json';
+import viTranslations from '../src/locales/vi/translation.json';
+
+const getLanguage = () => {
+  try {
+    const testPath = expect.getState().testPath;
+    if (testPath && testPath.includes('ProfilePage')) {
+      return 'vi';
+    }
+  } catch {
+    // ignore
+  }
+  return (globalThis as any).__activeLanguage || 'en';
+};
+
+const translate = (key: string) => {
+  const parts = key.split('.');
+  const activeLang = getLanguage() === 'vi' ? viTranslations : enTranslations;
+  let result: any = activeLang;
+  for (const part of parts) {
+    if (result && typeof result === 'object' && part in result) {
+      result = result[part];
+    } else {
+      return key;
+    }
+  }
+  return typeof result === 'string' ? result : key;
+};
+
+const mockI18n = {
+  use: () => mockI18n,
+  init: () => Promise.resolve(),
+  t: translate,
+  changeLanguage: (lng: string) => {
+    (globalThis as any).__activeLanguage = lng;
+    return Promise.resolve();
+  },
+  get language() {
+    return getLanguage();
+  },
+};
+
+vi.mock('i18next', () => ({
+  default: mockI18n,
+  t: translate,
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: translate,
+    i18n: {
+      changeLanguage: (lng: string) => {
+        (globalThis as any).__activeLanguage = lng;
+        return Promise.resolve();
+      },
+      get language() {
+        return getLanguage();
+      },
+    },
+  }),
+  initReactI18next: {
+    type: '3rdParty',
+    init: () => {},
+  },
+}));
 
 const createStorage = () => {
   let store: Record<string, string> = {};

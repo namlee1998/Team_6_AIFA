@@ -1,24 +1,23 @@
 const { Project, Folder, Document } = require('../models');
-const MembershipService = require('./MembershipService');
 
 class TreeService {
   async getTree(user) {
-    const projectIds = await MembershipService.listAccessibleProjectIds(user.id);
+    const projects = await Project.list();
+    const projectIds = projects.map((project) => project.id);
     if (projectIds.length === 0) {
       return { projects: [], folders: [], documents: [] };
     }
 
-    const projects = await Project.listByIds(projectIds);
     const folders = (await Promise.all(projectIds.map((projectId) => Folder.listByProjectId(projectId)))).flat();
     const docResults = await Promise.all(
       projectIds.map((projectId) => Document.list({ projectId, limit: 5000, offset: 0 })),
     );
 
     return {
-      projects: await Promise.all(projects.map(async (project) => ({
+      projects: projects.map((project) => ({
         ...project,
-        role: await MembershipService.getUserProjectRole(user.id, project.id),
-      }))),
+        role: 'owner',
+      })),
       folders,
       documents: docResults.flatMap((result) => result.rows),
     };
@@ -26,3 +25,4 @@ class TreeService {
 }
 
 module.exports = new TreeService();
+

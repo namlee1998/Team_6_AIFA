@@ -1,6 +1,6 @@
 const { v4: uuidv4 } = require('uuid');
 const { Folder, Project } = require('../models');
-const MembershipService = require('./MembershipService');
+
 const { ApiError } = require('../middleware/errorHandler');
 
 function normalizeName(name) {
@@ -10,7 +10,6 @@ function normalizeName(name) {
 class FolderService {
   async listFolders(projectId, user) {
     if (!projectId) throw new ApiError(400, 'project_id is required');
-    await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer']);
     const project = await Project.findById(projectId);
     if (!project) throw new ApiError(404, 'Project not found');
     return Folder.listByProjectId(projectId);
@@ -20,7 +19,6 @@ class FolderService {
     const trimmedName = normalizeName(name);
     if (!projectId) throw new ApiError(400, 'project_id is required');
     if (!trimmedName) throw new ApiError(400, 'Folder name is required');
-    await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor']);
 
     const project = await Project.findById(projectId);
     if (!project) throw new ApiError(404, 'Project not found');
@@ -47,7 +45,6 @@ class FolderService {
 
     const folder = await Folder.findById(folderId);
     if (!folder) throw new ApiError(404, 'Folder not found');
-    await MembershipService.requireProjectRole(user.id, folder.projectId, ['owner', 'admin', 'editor']);
 
     return Folder.update(folderId, { name: trimmedName });
   }
@@ -55,12 +52,8 @@ class FolderService {
   async moveFolder(folderId, { parentId, projectId, sortOrder, user }) {
     const folder = await Folder.findById(folderId);
     if (!folder) throw new ApiError(404, 'Folder not found');
-    await MembershipService.requireProjectRole(user.id, folder.projectId, ['owner', 'admin', 'editor']);
 
     const targetProjectId = projectId || folder.projectId;
-    if (targetProjectId !== folder.projectId) {
-      await MembershipService.requireProjectRole(user.id, targetProjectId, ['owner', 'admin', 'editor']);
-    }
     const targetProject = await Project.findById(targetProjectId);
     if (!targetProject) throw new ApiError(404, 'Target project not found');
 
@@ -85,7 +78,6 @@ class FolderService {
   async deleteFolder(folderId, user) {
     const folder = await Folder.findById(folderId);
     if (!folder) throw new ApiError(404, 'Folder not found');
-    await MembershipService.requireProjectRole(user.id, folder.projectId, ['owner', 'admin', 'editor']);
     await Folder.delete(folderId);
     return true;
   }

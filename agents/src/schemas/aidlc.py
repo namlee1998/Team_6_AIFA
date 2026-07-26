@@ -90,6 +90,7 @@ class POAgentInput(BaseModel):
     feature_request: FeatureRequest
     project_context: ProjectContext = Field(default_factory=ProjectContext)
     feedback_prompt: str = Field(default="")
+    previous_draft: str | None = Field(default=None)
 
 class POAgentOutput(BaseModel):
     prd: str = Field(default="", description="Product Requirements Document — markdown")
@@ -115,6 +116,7 @@ class UXAgentInput(BaseModel):
     user_stories: list[UserStory] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
     feedback_prompt: str = Field(default="")
+    previous_draft: str | None = Field(default=None)
 
 class UXAgentOutput(BaseModel):
     ux_spec: str = Field(default="", description="UX Spec — markdown")
@@ -134,7 +136,7 @@ class ChangedFile(BaseModel):
     change_type: str = Field(default="modify", description="add / modify / delete")
 
 class SandboxReport(BaseModel):
-    """Structured result of running the patch inside the E2B sandbox."""
+    """Structured result of running the patch inside the local git worktree sandbox."""
     build_ok: bool = Field(default=False, description="Did the patch build/install successfully")
     tests_ran: bool = Field(default=False, description="Were tests actually executed")
     tests_passed: int = Field(default=0)
@@ -149,6 +151,7 @@ class DEVAgentInput(BaseModel):
     project_context: ProjectContext = Field(default_factory=ProjectContext)
     architecture_ledger: str = Field(default="", description="Lịch sử thay đổi hệ thống trước đây")
     feedback_prompt: str = Field(default="")
+    previous_draft: str | None = Field(default=None)
 
 class DEVAgentOutput(BaseModel):
     architecture_ledger_update: str = Field(default="", description="Những thay đổi kiến trúc sau Story này")
@@ -208,6 +211,7 @@ class QAAgentInput(BaseModel):
     risk_assessment: str = Field(default="")
     risk_level: str = Field(default="LOW")
     feedback_prompt: str = Field(default="")
+    previous_draft: str | None = Field(default=None)
 
 class QAAgentOutput(BaseModel):
     test_cases: list[QATestCase] = Field(default_factory=list)

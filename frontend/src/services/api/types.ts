@@ -259,46 +259,6 @@ export interface YamlFile {
   content: string;
 }
 
-// --- Auth ---
-
-export interface AuthUser {
-  id: string;
-  email: string | null;
-  user_metadata?: Record<string, unknown> | null;
-}
-
-export interface AuthSession {
-  access_token: string;
-  refresh_token: string | null;
-  expires_at: number | null;
-  user: AuthUser | null;
-}
-
-// --- Profile ---
-
-export interface Profile {
-  user_id: string;
-  email: string | null;
-  full_name: string | null;
-  age: number | null;
-  job_title: string | null;
-  address: string | null;
-  phone: string | null;
-  bio: string | null;
-  avatar_url: string | null;
-  created_at: string | null;
-  updated_at: string | null;
-}
-
-export interface ProfilePayload {
-  full_name?: string | null;
-  age?: number | null;
-  job_title?: string | null;
-  address?: string | null;
-  phone?: string | null;
-  bio?: string | null;
-}
-
 // --- SSE Events (parsed from event-stream) ---
 
 export interface SSEProgressEvent {

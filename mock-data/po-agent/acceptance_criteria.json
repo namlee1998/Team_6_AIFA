@@ -1,8 +1,0 @@
-[
-  "AC-1: Màn hình đăng nhập hiển thị nút \"Sign in with Google\".",
-  "AC-2: Nhấn nút \"Sign in with Google\" điều hướng người dùng tới màn hình đồng ý (consent) của Google.",
-  "AC-3: Xác thực thành công với người dùng chưa tồn tại sẽ tạo một tài khoản mới dựa trên email từ hồ sơ Google.",
-  "AC-4: Xác thực thành công với người dùng đã tồn tại sẽ đăng nhập họ và cấp một session token hợp lệ.",
-  "AC-5: Khi người dùng từ chối quyền hoặc xác thực thất bại, họ được đưa về màn hình đăng nhập kèm thông báo lỗi rõ ràng.",
-  "AC-6: Dữ liệu hồ sơ Google (email, tên, avatar) được lưu hoặc cập nhật vào bản ghi người dùng."
-]

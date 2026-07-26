@@ -1,130 +1,143 @@
 {
-  "landing": {
-    "titleMain": "Ngừng viết test case",
-    "titleHighlight": "thủ công.",
-    "subtitleMain": "Tải lên tài liệu PRD và User Flow. Hệ thống AI với 3 Agents chuyên biệt của chúng tôi sẽ đọc, thiết kế và tạo ra",
-    "subtitleHighlight": "kịch bản test AutoMobile YAML hoàn chỉnh",
-    "subtitleEnd": "— chỉ trong vài giây.",
-    "startBtn": "Bắt Đầu Tạo Test",
-    "howItWorksBtn": "Xem Cách Hoạt Động",
-    "badgeAI": "AI Đa Tác Vụ · PRD → Kịch bản Test → YAML",
-    "stats": {
-      "agents": "AI Agents",
-      "time": "Mỗi test case",
-      "spec": "Chuẩn AutoMobile",
-      "effort": "Thao tác thủ công"
-    },
-    "pipeline": {
-      "tag": "PIPELINE XỬ LÝ",
-      "title": "Cách Hoạt Động",
-      "subtitle": "Ba Agent chuyên biệt làm việc nối tiếp nhau — mỗi Agent có một nhiệm vụ duy nhất và rõ ràng.",
-      "flowInput": "Đầu vào: PRD + User Flow + Mô Tả UI",
-      "flowOutput": "Đầu ra: Mã AutoMobile YAML",
-      "agent1": {
-        "title": "Chuẩn Hóa Luồng (Flow)",
-        "desc": "Đọc tài liệu PRD + User Flow. Trích xuất và chuẩn hóa tất cả các luồng thành cấu trúc rõ ràng cho máy đọc hiểu."
-      },
-      "agent2": {
-        "title": "Thiết Kế Kịch Bản (Scenario)",
-        "desc": "Đóng vai trò như một Senior QA. Thiết kế các kịch bản Happy, Negative, Edge, và Validation từ mỗi luồng đã chuẩn hóa."
-      },
-      "agent3": {
-        "title": "Tạo Mã YAML",
-        "desc": "Dịch mỗi kịch bản test thành một file AutoMobile YAML hoàn chỉnh, sẵn sàng chạy với các selector UI thực tế."
-      }
-    },
-    "documents": {
-      "tag": "TÀI LIỆU CỦA BẠN",
-      "title": "Chỉ Cần 3 Tài Liệu.",
-      "subtitle": "Không cần code. Không cần cấu hình. Chỉ cần tải lên các tài liệu dự án sẵn có của bạn và để các Agent làm phần còn lại.",
-      "prd": {
-        "title": "PRD — Yêu Cầu Sản Phẩm",
-        "desc": "Mô tả tính năng, logic nghiệp vụ, quy tắc đầu vào/đầu ra. Nguồn gốc cho mọi hoạt động của ứng dụng."
-      },
-      "flow": {
-        "title": "Tài Liệu User Flow",
-        "desc": "Trình tự hành vi của người dùng theo từng bước. Mô tả cách người dùng tương tác với mỗi màn hình và tính năng."
-      },
-      "ui": {
-        "title": "Mô Tả UI",
-        "desc": "Chi tiết mọi thành phần UI trên từng màn hình — ID phần tử, nhãn, trạng thái. Agent 3 sử dụng để ánh xạ các selector."
-      }
-    },
-    "demo": {
-      "tag": "Ví dụ thực tế",
-      "title": "Xem sự biến đổi",
-      "subtitle": "Từ mô tả tiếng người ↔ mã YAML thực thi — hoàn toàn tự động.",
-      "terminal": "aidlc-platform / pipeline demo",
-      "inputTag": "ĐẦU VÀO",
-      "outputTag": "ĐẦU RA",
-      "aiGenerated": "AI Tạo Ra"
-    },
-    "enterprise": {
-      "tag": "TẠI SAO CÁC NHÓM CHỌN CHÚNG TÔI",
-      "title": "Khả năng truy xuất nguồn gốc cấp doanh nghiệp,\nmà không bị quá tải.",
-      "feature1": "Pipeline toàn trình: PRD → Luồng chuẩn hóa → Kịch bản Test → YAML",
-      "feature2": "Có sự kiểm duyệt của con người tại mỗi bước chuyển giao giữa các Agent",
-      "feature3": "Vô hiệu hóa theo tầng — chạy lại Agent 1 và tự động cập nhật phần sau",
-      "feature4": "Truy xuất nguồn gốc đầy đủ: bất kỳ bước YAML nào cũng có thể truy ngược về yêu cầu gốc",
-      "feature5": "Hỗ trợ các trường hợp Happy path, Negative, Edge, Validation & Quy tắc kinh doanh",
-      "miniPipeline": {
-        "step1": "PRD + User Flow",
-        "step2": "Agent 1 → Luồng chuẩn hóa",
-        "step3": "Agent 2 → Kịch bản Test",
-        "step4": "Agent 3 → Mã AutoMobile YAML",
-        "tags": {
-          "input": "Đầu vào",
-          "processing": "Đang xử lý",
-          "output": "Đầu ra"
-        }
-      }
-    },
-    "cta": {
-      "ready": "SẴN SÀNG?",
-      "title": "Tự động hóa pipeline QA ngay hôm nay.",
-      "subtitle": "Ngừng lãng phí hàng tuần để viết kịch bản test bằng tay. Hãy để 3 AI Agent làm việc đó trong vài giây — nhất quán, mọi lúc.",
-      "startBtn": "Bắt Đầu Miễn Phí"
-    },
-    "footer": {
-      "copyright": "© 2026 AIDLC Control Platform. Được phát triển bởi Team 6.",
-      "docs": "Tài liệu",
-      "architecture": "Kiến trúc",
-      "signIn": "Đăng nhập"
-    }
-  },
-  "nav": {
-    "title": "AIDLC Platform",
-    "badge": "AI Cấp Quyền",
-    "signIn": "Đăng Nhập",
-    "goToApp": "Vào Ứng Dụng",
-    "getStarted": "Bắt Đầu"
-  },
   "notFound": {
-    "eyebrow": "404 - Khong tim thay trang",
-    "title": "Trang nay khong ton tai",
-    "description": "Lien ket ban mo khong ton tai, co the da duoc di chuyen hoac khong con kha dung trong workspace nay.",
-    "goToApp": "Vao ung dung",
-    "signIn": "Dang nhap",
-    "goHome": "Ve trang chu",
-    "goBack": "Quay lai"
+    "eyebrow": "404 - Không tìm thấy trang",
+    "title": "Trang này nằm ngoài bản đồ",
+    "description": "Trang bạn mở không tồn tại, có thể đã được di chuyển hoặc không còn khả dụng trong không gian làm việc này.",
+    "goToApp": "Vào ứng dụng",
+    "signIn": "Đăng nhập",
+    "goHome": "Quay lại trang chủ",
+    "goBack": "Quay lại"
   },
   "upload": {
-    "dragDrop": "Kéo thả hoặc bấm để tải nhiều file",
-    "viewerOnly": "Bạn chỉ có quyền xem project này",
-    "selectProject": "Chọn dự án ở panel trái để bật tải file",
+    "dragDrop": "Nhấp hoặc kéo thả để tải lên nhiều tệp",
+    "viewerOnly": "Bạn chỉ có quyền xem dự án này",
+    "selectProject": "Chọn một dự án từ danh sách bên trái để tải lên",
     "uploading": "Đang tải lên...",
     "target": "Đích tải lên",
-    "noTarget": "Chưa có đích tải lên",
-    "chooseFile": "Chọn file",
-    "title": "Quản lý tài liệu",
-    "subtitle": "Project-based File/Folder CRUD để tách dữ liệu cho từng flow agent."
+    "noTarget": "Chưa chọn đích tải lên",
+    "chooseFile": "Chọn tệp",
+    "title": "Quản lý Tài liệu",
+    "subtitle": "Thao tác File/Folder theo dự án để cô lập dữ liệu cho flow agent."
   },
   "agent": {
     "run": "Chạy Agent",
     "running": "Đang xử lý...",
     "completed": "Hoàn thành",
-    "failed": "Thất bại",
-    "runAll": "Chạy tất cả",
-    "runAnalysis": "Chạy phân tích luồng"
+    "failed": "Thất bại"
+  },
+  "common": {
+    "confirm": "Xác nhận",
+    "cancel": "Hủy",
+    "other": "Khác",
+    "loading": "Đang tải...",
+    "search": "Tìm kiếm",
+    "delete": "Xóa",
+    "refresh": "Làm mới"
+  },
+  "errorBoundary": {
+    "title": "Lỗi Thực thi Giao diện",
+    "description": "Đã xảy ra sự cố đột ngột khi tải giao diện ứng dụng. Bạn có thể tải lại trang hoặc quay lại.",
+    "reload": "Tải lại Ứng dụng",
+    "goDashboard": "Về Dashboard",
+    "technicalLog": "MÃ LỖI KỸ THUẬT",
+    "show": "Hiện",
+    "hide": "Ẩn"
+  },
+  "emptyProject": {
+    "welcome": "Chào mừng đến với Autonomous Factory",
+    "desc": "Bắt đầu bằng cách chọn hoặc nhập dự án, sau đó mô tả tính năng bạn muốn xây dựng. Hệ thống sẽ dẫn dắt bạn qua từng AI agent và các bước duyệt kết quả.",
+    "step1": "1. Nhập dự án đầu tiên của bạn",
+    "step2": "2. Chọn 'Yêu Cầu Tính Năng Mới' và mô tả yêu cầu",
+    "step3": "3. Chạy PO Agent từ tab backlog",
+    "step4": "4. Phê duyệt kết quả để chuyển sang agent tiếp theo",
+    "btnCreate": "Nhập dự án đầu tiên của bạn"
+  },
+  "kanban": {
+    "selectProject": "Vui lòng chọn một dự án để xem bảng Kanban.",
+    "noCards": "Chưa có thẻ nào",
+    "workspace": "Không gian làm việc",
+    "title": "Feature Backlog",
+    "desc": "Tạo yêu cầu, sau đó bắt đầu quy trình bàn giao tự động.",
+    "newRequest": "Yêu Cầu Tính Năng Mới",
+    "refresh": "Tải lại backlog",
+    "startFirst": "Bắt đầu bằng cách tạo Yêu Cầu Tính Năng đầu tiên",
+    "appearTodo": "Nó sẽ xuất hiện trong cột Cần Làm, sẵn sàng cho PO Agent.",
+    "readyStart": "Sẵn sàng khởi động quy trình",
+    "clickStart": "Nhấn nút Chạy PO Agent trên thẻ trong cột Cần Làm."
+  },
+  "artifact": {
+    "all": "Tất cả",
+    "noArtifacts": "Chưa có kết quả nào. Hãy chạy một agent để tạo dữ liệu.",
+    "placeholder": "Chọn một tài liệu để xem nội dung",
+    "editGroom": "Chỉnh sửa / Trau chuốt",
+    "saveApprove": "Lưu & Phê duyệt"
+  },
+  "audit": {
+    "emptyTitle": "Chưa có lịch sử duyệt",
+    "emptyDesc": "Chạy Agent hoặc thực hiện kiểm duyệt để xem lịch sử.",
+    "filterRole": "Lọc theo vai trò:",
+    "all": "Tất cả",
+    "eventType": "Loại sự kiện:",
+    "noEvents": "Không tìm thấy sự kiện phù hợp với bộ lọc.",
+    "qualityReviewed": "Đã kiểm duyệt chất lượng:",
+    "attempt": "lần thử",
+    "blockingIssues": "vấn đề chặn",
+    "blockingIssuesPlural": "các vấn đề chặn",
+    "decisionApprove": "Phê duyệt",
+    "decisionReject": "Từ chối",
+    "decisionRework": "Yêu cầu sửa lại",
+    "hitlGate": "Cửa kiểm duyệt HITL"
+  },
+  "layout": {
+    "newFeatureRequest": "Yêu cầu tính năng mới",
+    "chooseProjectFirst": "Vui lòng chọn một dự án từ sidebar trước",
+    "projectsTitle": "Dự án",
+    "createProject": "Nhập thư mục cục bộ",
+    "workspace": "Không gian làm việc",
+    "noProjects": "Chưa có dự án nào",
+    "createProjectBtn": "Nhập Dự Án",
+    "cancel": "Hủy",
+    "creating": "Đang nhập...",
+    "createProjectTitle": "Nhập Dự Án từ Thư Mục Cục Bộ",
+    "projectNameLabel": "Đường dẫn thư mục cục bộ",
+    "projectNamePlaceholder": "Nhập đường dẫn tuyệt đối (ví dụ: C:\\Projects\\my-project)...",
+    "createProjectFailed": "Không thể nhập dự án",
+    "deleteProjectConfirm": "Xóa dự án?",
+    "deleteProjectDesc": "Thao tác này sẽ xóa vĩnh viễn {name} và toàn bộ dữ liệu workflow của nó.",
+    "confirmDeleteBtn": "Xóa dự án",
+    "deleting": "Đang xóa...",
+    "projectActionDeleted": "Đã xóa \"{name}\".",
+    "projectActionDeleteFailed": "Không thể xóa dự án.",
+    "searchPlaceholder": "Tìm kiếm dự án & tài nguyên...",
+    "expand": "Mở rộng",
+    "collapse": "Thu gọn"
+  },
+  "dashboard": {
+    "workspace": "Không gian làm việc AIDLC",
+    "title": "Xây dựng tính năng với 4 AI workers",
+    "subtitle": "Gửi yêu cầu một lần tới PO. Các Worker tự động tiếp tục và chỉ dừng lại khi cần con người phê duyệt.",
+    "build": "Build",
+    "audit": "Audit",
+    "newRequest": "Yêu cầu tính năng mới",
+    "loadError": "Không thể tải quy trình xử lý.",
+    "executionFailed": "Lỗi thực thi Agent.",
+    "sendFailed": "Không thể gửi yêu cầu tính năng tới PO Agent.",
+    "openGateFailed": "Không thể mở giao diện phê duyệt."
+  },
+  "hitl": {
+    "title": "Trung tâm can thiệp",
+    "totalPending": "Tổng chờ xử lý",
+    "securityRisks": "Rủi ro bảo mật",
+    "poQuestions": "Câu hỏi PO",
+    "avgResolution": "Thời gian giải quyết trung bình",
+    "navigateResolve": "Đi tới xử lý",
+    "emptyState": "Tất cả đã xong! Không có vấn đề chờ xử lý.",
+    "errorFetch": "Không thể tải danh sách",
+    "retry": "Thử lại",
+    "timelineTitle": "Lịch sử duyệt & Sự kiện ghi đè",
+    "projectLabel": "Dự án:",
+    "typeLabel": "Loại:",
+    "phaseLabel": "Giai đoạn:",
+    "contextBtn": "Xem chi tiết"
   }
 }

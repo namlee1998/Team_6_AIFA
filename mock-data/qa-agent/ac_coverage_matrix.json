@@ -1,8 +1,0 @@
-[
-  { "ac_id": "AC-1", "ac": "AC-1: Nút 'Sign in with Google' hiển thị trên màn hình đăng nhập", "test_case_ids": ["TC-001"], "covered": true },
-  { "ac_id": "AC-2", "ac": "AC-2: Nhấn nút điều hướng tới màn hình đồng ý của Google", "test_case_ids": ["TC-002", "TC-007", "TC-015"], "covered": true },
-  { "ac_id": "AC-3", "ac": "AC-3: Người dùng mới tạo tài khoản từ email Google", "test_case_ids": ["TC-003", "TC-008", "TC-012", "TC-018"], "covered": true },
-  { "ac_id": "AC-4", "ac": "AC-4: Người dùng cũ đăng nhập và nhận session token", "test_case_ids": ["TC-004", "TC-006", "TC-009", "TC-013", "TC-016", "TC-017"], "covered": true },
-  { "ac_id": "AC-5", "ac": "AC-5: Từ chối/lỗi → quay về đăng nhập kèm thông báo", "test_case_ids": ["TC-005", "TC-010"], "covered": true },
-  { "ac_id": "AC-6", "ac": "AC-6: Lưu/cập nhật email, tên, avatar từ hồ sơ Google", "test_case_ids": ["TC-011", "TC-014"], "covered": true }
-]

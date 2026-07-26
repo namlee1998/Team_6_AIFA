@@ -26,7 +26,7 @@ export interface FeatureGroup {
   totalYaml: number;
 }
 
-export function getScenarioData(tc: TestcaseItem): ScenarioData {
+function getScenarioData(tc: TestcaseItem): ScenarioData {
   const d = (tc.scenarioData ?? {}) as Record<string, unknown>;
   return {
     id: String(d.id ?? tc.id),

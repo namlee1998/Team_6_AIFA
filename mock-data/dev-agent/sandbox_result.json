@@ -1,7 +1,0 @@
-{
-  "build_ok": true,
-  "tests_ran": true,
-  "tests_passed": 2,
-  "tests_failed": 0,
-  "logs": "npm install: 312 packages in 8.4s\nnpm test -- tests/googleAuth.test.js: 2 passed, 0 failed (1.93s)\nnpm run lint: no problems"
-}

@@ -19,6 +19,7 @@ router.get('/', DocumentController.list.bind(DocumentController));
 router.patch('/:id/move', DocumentController.move.bind(DocumentController));
 router.patch('/:id', DocumentController.rename.bind(DocumentController));
 router.get('/:id/preview', DocumentController.getPreviewUrl.bind(DocumentController));
+router.get('/:id/download', DocumentController.download.bind(DocumentController));
 router.get('/:id/content', DocumentController.getContent.bind(DocumentController));
 router.get('/:id', DocumentController.getById.bind(DocumentController));
 router.delete('/:id', DocumentController.delete.bind(DocumentController));

@@ -12,8 +12,8 @@ jest.mock('../../src/models', () => ({
 
 jest.mock('../../src/models/FeatureBacklog', () => ({}));
 jest.mock('../../src/services/AgentService', () => ({}));
-jest.mock('../../src/services/MembershipService', () => ({ requireProjectRole: jest.fn() }));
-jest.mock('../../src/services/QuotaService', () => ({}));
+jest.mock('../../src/services/MembershipService', () => ({ requireProjectRole: jest.fn() }), { virtual: true });
+jest.mock('../../src/services/QuotaService', () => ({}), { virtual: true });
 jest.mock('../../src/services/QualityGateService', () => ({}));
 
 const SdlcWorkflowService = require('../../src/services/SdlcWorkflowService');

@@ -1,3 +1,4 @@
+const path = require('path');
 const DocumentService = require("../services/DocumentService");
 
 class DocumentController {
@@ -229,6 +230,29 @@ class DocumentController {
           created_at: doc.createdAt,
         },
       });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * Download the local document file
+   * GET /api/v1/documents/:id/download
+   */
+  async download(req, res, next) {
+    try {
+      const { id } = req.params;
+      const document = await DocumentService.getDocumentById(id, req.user);
+      if (!document) {
+        return res.status(404).json({
+          status: "error",
+          message: "Document not found",
+        });
+      }
+
+      const uploadsDir = path.join(__dirname, '../../uploads');
+      const filePath = path.resolve(uploadsDir, document.filePath);
+      return res.sendFile(filePath);
     } catch (error) {
       next(error);
     }

@@ -70,3 +70,25 @@ def test_dispatch_parses_downstream_sdlc_artifacts():
     assert dev.ux_spec == "# UX"
     assert isinstance(qa, QAAgentInput)
     assert qa.implementation_plan == "# Plan"
+
+
+def test_qa_dispatch_prefers_real_patch_and_structured_sandbox_evidence():
+    qa = _parse_agent_input(
+        "qa_agent",
+        {
+            "patch_diff": [{"content": "diff --git a/src/a.js b/src/a.js"}],
+            "mock_code_diff": [{"content": "old mock diff"}],
+            "sandbox_result": [
+                {
+                    "content": {
+                        "tests_ran": True,
+                        "build_ok": True,
+                        "tests_passed": 3,
+                    }
+                }
+            ],
+        },
+    )
+
+    assert qa.mock_code_diff.startswith("diff --git")
+    assert '"tests_ran": true' in qa.sandbox_report.lower()

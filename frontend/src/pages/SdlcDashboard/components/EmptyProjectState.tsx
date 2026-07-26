@@ -1,9 +1,11 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { Bot, CheckCircle2, PlusCircle } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { useAppStore } from '@/store/useAppStore';
 
 export default function EmptyProjectState() {
+  const { t } = useTranslation();
   const setCreateProjectDialogOpen = useAppStore((s) => s.setCreateProjectDialogOpen);
 
   return (
@@ -17,17 +19,16 @@ export default function EmptyProjectState() {
         <div className="sdlc-empty-icon-wrap">
           <Bot size={48} className="sdlc-empty-icon" />
         </div>
-        <h2>Welcome to Autonomous Factory</h2>
+        <h2>{t('emptyProject.welcome')}</h2>
         <p>
-          Bắt đầu với một project, sau đó mô tả feature cần xây dựng. Hệ thống sẽ
-          dẫn bạn qua từng AI agent và các bước duyệt kết quả.
+          {t('emptyProject.desc')}
         </p>
         <div className="mt-5 grid gap-2 text-left">
           {[
-            '1. Tạo project đầu tiên',
-            '2. Chọn New Feature Request và mô tả yêu cầu',
-            '3. Chạy PO Agent từ thẻ backlog',
-            '4. Duyệt kết quả để mở khóa agent tiếp theo',
+            t('emptyProject.step1'),
+            t('emptyProject.step2'),
+            t('emptyProject.step3'),
+            t('emptyProject.step4'),
           ].map((step) => (
             <div key={step} className="flex items-center gap-2 text-sm text-on-surface-variant">
               <CheckCircle2 size={15} className="shrink-0 text-emerald-400" />
@@ -39,7 +40,7 @@ export default function EmptyProjectState() {
           className="sdlc-empty-hint mt-5 hover:bg-emerald-500/20 transition-colors cursor-pointer"
           onClick={() => setCreateProjectDialogOpen(true)}
         >
-          <PlusCircle size={16} /> <span>Tạo project đầu tiên</span>
+          <PlusCircle size={16} /> <span>{t('emptyProject.btnCreate')}</span>
         </button>
       </motion.div>
     </div>

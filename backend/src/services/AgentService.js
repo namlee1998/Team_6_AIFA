@@ -36,6 +36,7 @@ class AgentService {
           source_run_id: sourceRunId,
           node_target: nodeTarget,
           context,
+          auto_approve: process.env.AUTO_APPROVE_TOOLS === 'true',
         },
         {
           headers: { 'Content-Type': 'application/json' },

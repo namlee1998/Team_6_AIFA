@@ -1,8 +1,14 @@
 import { AlertTriangle, X } from 'lucide-react';
-import type { SdlcError } from '@/store/useSdlcStore';
+
+export interface DeliveryErrorDetail {
+  message: string;
+  code?: string;
+  phase?: string;
+  requestId?: string;
+}
 
 interface Props {
-  error: SdlcError | null;
+  error: DeliveryErrorDetail | string | null;
   onDismiss?: () => void;
 }
 
@@ -13,17 +19,18 @@ interface Props {
  */
 export default function DeliveryErrorBanner({ error, onDismiss }: Props) {
   if (!error) return null;
+  const detail: DeliveryErrorDetail = typeof error === 'string' ? { message: error } : error;
   return (
     <div className="delivery-error delivery-error--rich" role="alert">
       <AlertTriangle size={15} className="delivery-error__icon" />
       <div className="delivery-error__body">
-        <div className="delivery-error__message">{error.message}</div>
+        <div className="delivery-error__message">{detail.message}</div>
         <div className="delivery-error__meta">
-          {error.code && <span className="delivery-error__chip">code: {error.code}</span>}
-          {error.phase && <span className="delivery-error__chip">phase: {error.phase}</span>}
-          {error.requestId && (
+          {detail.code && <span className="delivery-error__chip">code: {detail.code}</span>}
+          {detail.phase && <span className="delivery-error__chip">phase: {detail.phase}</span>}
+          {detail.requestId && (
             <span className="delivery-error__chip delivery-error__chip--req" title="Correlates with the server log line">
-              requestId: {error.requestId}
+              requestId: {detail.requestId}
             </span>
           )}
         </div>

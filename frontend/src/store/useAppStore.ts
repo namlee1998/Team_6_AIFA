@@ -248,17 +248,19 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setCurrentProject: (id) => {
     const current = get().currentProjectId;
-    // Không reset nếu không đổi project
+    // Do not reset if project is not changed
     if (current === id) return;
 
-    // Dừng SSE nếu đang chạy
+    // Stop SSE if running
     if (sseAbort) {
       sseAbort.abort();
       sseAbort = null;
     }
 
-    // Xóa session state phía backend (fire-and-forget)
-    api.deleteSessionState('flow_analysis', current).catch(() => {});
+    // Clear backend session state (fire-and-forget). Previously called
+    // api.deleteSessionState, which lived in flowsApi and was removed when
+    // that file was deleted as part of the SSE transport refactor. Nothing
+    // else depends on this state, so we drop the call.
 
     if (id) localStorage.setItem('currentProjectId', id);
     else localStorage.removeItem('currentProjectId');

@@ -1,5 +1,10 @@
-// Prisma schema for AIDLC Backend
-// This file sets up SQLite to replace Supabase PostgreSQL
+// AIFA persistence map.
+//
+// Beginner reading guide:
+// - Start with Task, AgentEvent, AgentArtifact, HitlDecision, and PendingGate.
+// - Task stores one worker run; AgentEvent stores its ordered lifecycle history.
+// - Artifact content may live on disk while this database stores its metadata.
+// - SQLite is the active local/runtime database; DATABASE_URL isolates dev/tests.
 
 generator client {
   provider = "prisma-client-js"
@@ -7,7 +12,7 @@ generator client {
 
 datasource db {
   provider = "sqlite"
-  // I1: env-driven so tests/CI/smoke can target an isolated sqlite file and
+  // Env-driven so tests/CI/smoke can target an isolated sqlite file and
   // never touch dev.db. Local dev sets DATABASE_URL="file:./dev.db" in .env.
   url      = env("DATABASE_URL")
 }
@@ -16,41 +21,6 @@ datasource db {
 // Core Tables
 // ============================================
 
-model User {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  password  String   // Added for local auth
-  role      String   @default("user")
-  createdAt DateTime @default(now())
-  
-  projects  ProjectMembership[]
-  tasks     Task[]
-}
-
-model AdminUser {
-  id           String   @id @default(uuid())
-  email        String   @unique
-  passwordHash String
-  fullName     String?
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-}
-
-model Profile {
-  userId     String   @id
-  fullName   String?
-  age        Int?
-  jobTitle   String?
-  address    String?
-  phone      String?
-  bio        String?
-  avatarUrl  String?
-  avatarPath String?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-}
-
 model Project {
   id          String   @id @default(uuid())
   name        String
@@ -58,42 +28,42 @@ model Project {
   createdBy   String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
-  
-  members     ProjectMembership[]
+
   tasks       Task[]
-}
-
-model ProjectMembership {
-  id        String   @id @default(uuid())
-  userId    String
-  projectId String
-  role      String   @default("member")
-  invitedBy String?
-  joinedAt  DateTime?
-  
-  user      User     @relation(fields: [userId], references: [id])
-  project   Project  @relation(fields: [projectId], references: [id])
-}
-
-model ProjectInvitation {
-  id        String   @id @default(uuid())
-  projectId String
-  email     String
-  role      String   @default("member")
-  token     String   @unique
-  status    String   @default("pending")
-  invitedBy String
-  expiresAt DateTime
-  createdAt DateTime @default(now())
+  pipelineSessions PipelineSession[]
 }
 
 // ============================================
 // SDLC Pipeline Tables
 // ============================================
 
+// One independent PO->UX->DEV->QA feature-request run against a project's
+// uploaded repo. A project can have several of these running concurrently
+// (capped by MAX_PARALLEL_WORKFLOWS) — each gets its own working copy under
+// workspace/projects/{projectId}/sessions/{id}/repo, so sessions never share
+// or overwrite each other's (or the original upload's) files.
+model PipelineSession {
+  id            String   @id @default(uuid())
+  projectId     String
+  title         String?
+  status        String   @default("running") // running|completed|failed
+  repoPath      String?
+  workingBranch String?
+  baseBranch    String?
+  outputDir     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  project       Project  @relation(fields: [projectId], references: [id])
+  tasks         Task[]
+
+  @@index([projectId])
+}
+
 model Task {
   id                String   @id @default(uuid())
   projectId         String
+  sessionId         String?
   type              String   // "extract-flows", "generate-testcases", etc.
   status            String   @default("pending")
   promptProfile     String?
@@ -111,13 +81,47 @@ model Task {
   retryCount        Int      @default(0)
   lastRetryReason   String?
   gateMode          String?  // strict_manual | confidence_based | auto_approve_safe
+  executionStatus   String   @default("queued")
+  attempt           Int      @default(0)
+  maxAttempts       Int      @default(1)
+  lockedBy          String?
+  lockedAt          DateTime?
+  heartbeatAt       DateTime?
+  startedAt         DateTime?
+  finishedAt        DateTime?
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
-  userId            String?
-  user              User?    @relation(fields: [userId], references: [id])
   project           Project  @relation(fields: [projectId], references: [id])
+  session           PipelineSession? @relation(fields: [sessionId], references: [id])
   artifacts         AgentArtifact[]
+  events            AgentEvent[]
+
+  @@index([projectId, sessionId])
+}
+
+model AgentEvent {
+  id         String   @id @default(uuid())
+  taskId     String
+  projectId  String
+  sessionId  String?
+  sequence   Int
+  type       String
+  actor      String
+  payload    String?
+  envelope   String?  // JSON string — canonical EventEnvelope (preferred over payload for replay)
+  createdAt  DateTime @default(now())
+
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  // Per-session sequence space: every canonical EventEnvelope belongs to a
+  // session, and sequence is monotonically allocated by sequenceService.next.
+  // The unique constraint enforces the transport invariant at the persistence
+  // layer (one per-session sequence space).
+  @@unique([sessionId, sequence])
+  @@index([projectId, createdAt])
+  @@index([taskId, createdAt])
+  @@index([sessionId, sequence])
 }
 
 model AgentArtifact {
@@ -210,6 +214,24 @@ model HitlDecision {
   createdAt     DateTime @default(now())
 }
 
+model PendingGate {
+  approvalId String   @id
+  taskId     String
+  projectId  String?
+  role       String
+  kind       String
+  payload    String
+  status     String   @default("pending")
+  resolution String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  resolvedAt DateTime?
+
+  @@index([taskId])
+  @@index([projectId])
+  @@index([status])
+}
+
 model FeatureBacklog {
   id            String   @id @default(uuid())
   projectId     String
@@ -220,61 +242,5 @@ model FeatureBacklog {
   status        String   @default("draft")
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
-}
-
-model Plan {
-  id                   String   @id @default(uuid())
-  name                 String
-  creditsLimit         Int      @default(0)
-  maxProjects          Int?
-  maxMembersPerProject Int?
-  taskHistoryDays      Int?
-  description          String?
-  isActive             Boolean  @default(true)
-  createdAt            DateTime @default(now())
-}
-
-model UserSubscription {
-  id            String   @id @default(uuid())
-  userId        String   @unique
-  planId        String
-  status        String   @default("active")
-  creditsUsed   Int      @default(0)
-  creditsTotal  Int      @default(0)
-  periodStart   DateTime?
-  periodEnd     DateTime?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-}
-
-model UsageLog {
-  id            String   @id @default(uuid())
-  userId        String?
-  projectId     String?
-  taskId        String?
-  agentType     String
-  status        String
-  tokenInput    Int      @default(0)
-  tokenOutput   Int      @default(0)
-  tokenTotal    Int      @default(0)
-  creditsCharged Float   @default(0)
-  executedAt    DateTime @default(now())
-}
-
-model AuditLog {
-  id            String   @id @default(uuid())
-  userId        String?
-  action        String
-  entityType    String?
-  entityId      String?
-  details       String?  // JSON string
-  createdAt     DateTime @default(now())
-}
-
-model DashboardSnapshot {
-  id            String   @id @default(uuid())
-  date          DateTime @unique
-  metrics       String   // JSON string
-  createdAt     DateTime @default(now())
 }
 

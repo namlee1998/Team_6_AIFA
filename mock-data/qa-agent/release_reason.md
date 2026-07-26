@@ -1,1 +1,0 @@
-Tất cả 18 test case đã chạy thật và PASS (0 fail), độ phủ AC đạt 100% (6/6), không có blocker. Quét bảo mật không phát hiện vấn đề (CSRF state, cookie HttpOnly+Secure, không lộ khoá bí mật, kiểm audience ID token). Rủi ro regression thấp và đã được kiểm chứng. Do đó khuyến nghị: approve.

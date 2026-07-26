@@ -1,46 +1,36 @@
-import React from 'react';
-import { clsx, type ClassValue } from 'clsx';
-import { twMerge } from 'tailwind-merge';
+import * as React from "react"
+import { cn } from "@/lib/utils"
 
-/**
- * Utility to merge tailwind classes safely
- */
-function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
+export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger'
+  size?: 'default' | 'sm' | 'lg' | 'icon'
 }
 
-export type ButtonVariant = 'primary' | 'toolbar' | 'ghost' | 'utility' | 'outline';
+const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ className, variant = "primary", size = "default", ...props }, ref) => {
+    return (
+      <button
+        ref={ref}
+        className={cn(
+          "inline-flex items-center justify-center whitespace-nowrap rounded-lg text-sm font-bold ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 cursor-pointer",
+          {
+            "bg-primary text-on-primary hover:bg-primary-container": variant === "primary",
+            "bg-secondary text-on-secondary hover:bg-secondary-container": variant === "secondary",
+            "border border-outline-variant/60 bg-transparent hover:bg-surface-container": variant === "outline",
+            "hover:bg-surface-container text-on-surface hover:text-on-surface": variant === "ghost",
+            "bg-error text-white hover:bg-error/90 border border-error/50": variant === "danger",
+            "h-10 px-4 py-2": size === "default",
+            "h-8 rounded-md px-3 text-xs": size === "sm",
+            "h-11 rounded-lg px-8 text-base": size === "lg",
+            "h-10 w-10": size === "icon",
+          },
+          className
+        )}
+        {...props}
+      />
+    )
+  }
+)
+Button.displayName = "Button"
 
-interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: ButtonVariant;
-  className?: string;
-  children: React.ReactNode;
-}
-
-const variantClasses: Record<ButtonVariant, string> = {
-  primary:
-    'bg-gradient-to-br from-primary to-primary-container text-white rounded-xl font-headline font-bold shadow-lg hover:scale-[1.02] active:scale-[0.98] transition-all disabled:opacity-50 disabled:hover:scale-100',
-  toolbar:
-    'h-9 w-9 rounded-xl border border-outline-variant/30 bg-surface-container-low text-on-surface-variant hover:bg-surface-container-highest transition-colors flex items-center justify-center disabled:opacity-50',
-  ghost:
-    'w-full flex items-center px-3 py-2 hover:bg-surface-container-highest text-left transition-colors disabled:opacity-50',
-  utility: 'px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all disabled:opacity-50',
-  outline:
-    'flex items-center justify-center border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-xl transition-all disabled:opacity-50',
-};
-
-export const Button: React.FC<ButtonProps> = ({
-  variant = 'primary',
-  className,
-  children,
-  ...props
-}) => {
-  return (
-    <button
-      className={cn('flex items-center justify-center gap-2', variantClasses[variant], className)}
-      {...props}
-    >
-      {children}
-    </button>
-  );
-};
+export { Button }

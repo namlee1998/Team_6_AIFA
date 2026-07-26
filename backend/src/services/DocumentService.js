@@ -1,16 +1,25 @@
+const fs = require('fs/promises');
+const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const { Document, Project, Folder } = require('../models');
 const SessionState = require('../models/SessionState');
-const MembershipService = require('./MembershipService');
-const supabase = require('../config/database');
-const { MAX_FILE_SIZE, SUPABASE_STORAGE_BUCKET } = require('../config/environment');
+const MembershipService = {
+  requireProjectRole: async () => ({ role: 'owner' }),
+  listAccessibleProjectIds: async () => {
+    const projects = await Project.list();
+    return projects.map((p) => p.id);
+  },
+};
+const { MAX_FILE_SIZE } = require('../config/environment');
 const mammoth = require('mammoth');
 const pdfParse = require('pdf-parse');
 const { ApiError } = require('../middleware/errorHandler');
 
+const UPLOADS_DIR = path.join(__dirname, '../../uploads');
+
 class DocumentService {
   /**
-   * Upload file to Supabase Storage and create document record
+   * Upload file to local storage and create document record
    * @param {Object} file - Multer file object
    * @param {string} projectId
    * @param {string|null} folderId - Optional folder ID
@@ -44,19 +53,11 @@ class DocumentService {
     const documentId = uuidv4();
     const extension = file.originalname.split('.').pop();
     const storagePath = `${projectId}/${folderId || 'root'}/${documentId}.${extension}`;
+    const fullPath = path.join(UPLOADS_DIR, storagePath);
 
-    // Upload to Supabase Storage
-    const { error: uploadError } = await supabase
-      .storage
-      .from(SUPABASE_STORAGE_BUCKET)
-      .upload(storagePath, file.buffer, {
-        contentType: file.mimetype,
-        upsert: false,
-      });
-
-    if (uploadError) {
-      throw new Error(`Failed to upload file: ${uploadError.message}`);
-    }
+    // Save to local disk
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.writeFile(fullPath, file.buffer);
 
     // Create document record
     const document = await Document.create({
@@ -87,10 +88,10 @@ class DocumentService {
   }
 
   /**
-   * Get signed URL for a document
+   * Get preview/download URL for a document
    * @param {string} documentId
-   * @param {number} expiresIn - URL expiry in seconds
-   * @returns {Promise<{url: string}>} Signed URL
+   * @param {number} expiresIn - URL expiry in seconds (ignored for local files)
+   * @returns {Promise<{url: string}>} Local download URL
    */
   async getSignedUrl(documentId, expiresIn = 3600, user) {
     const document = await Document.findById(documentId);
@@ -101,20 +102,12 @@ class DocumentService {
       await MembershipService.requireProjectRole(user.id, document.projectId, ['owner', 'admin', 'editor', 'viewer']);
     }
 
-    const { data, error } = await supabase
-      .storage
-      .from(SUPABASE_STORAGE_BUCKET)
-      .createSignedUrl(document.filePath, expiresIn);
-
-    if (error) {
-      throw new Error(`Failed to generate signed URL: ${error.message}`);
-    }
-
-    return { url: data.signedUrl };
+    // Local-first preview url served from the backend download route
+    return { url: `/api/v1/documents/${document.id}/download` };
   }
 
   /**
-   * Download file content from Supabase Storage as text
+   * Download file content from local storage as text
    * @param {string} documentId
    * @returns {Promise<string>} File content as string
    */
@@ -127,20 +120,12 @@ class DocumentService {
       await MembershipService.requireProjectRole(user.id, document.projectId, ['owner', 'admin', 'editor', 'viewer']);
     }
 
-    // Get signed URL
-    const { data: signedData, error: signError } = await supabase
-      .storage
-      .from(SUPABASE_STORAGE_BUCKET)
-      .createSignedUrl(document.filePath, 60); // short-lived URL
-
-    if (signError) {
-      throw new Error(`Failed to generate signed URL: ${signError.message}`);
-    }
-
-    // Fetch content as buffer
-    const res = await fetch(signedData.signedUrl);
-    if (!res.ok) {
-      throw new Error(`Failed to download file: ${res.status} ${res.statusText}`);
+    const fullPath = path.join(UPLOADS_DIR, document.filePath);
+    let buffer;
+    try {
+      buffer = await fs.readFile(fullPath);
+    } catch (err) {
+      throw new Error(`Failed to read file: ${err.message}`);
     }
 
     const fileType = document.fileType?.toLowerCase() || '';
@@ -150,25 +135,21 @@ class DocumentService {
 
     // DOCX: extract text via mammoth
     if (fileType.includes('docx') || fileType.includes('wordprocessingml') || fileName.endsWith('.docx')) {
-      const arrayBuffer = await res.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
       const result = await mammoth.extractRawText({ buffer });
-      console.log(`[DocumentService.getContent] mammoth extracted ${result.value.length} chars, preview: ${result.value.slice(0, 200)}`);
+      console.log(`[DocumentService.getContent] mammoth extracted ${result.value.length} chars`);
       return result.value;
     }
 
     // PDF: extract text via pdf-parse
     if (fileType.includes('pdf') || fileName.endsWith('.pdf')) {
-      const arrayBuffer = await res.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
       const result = await pdfParse(buffer);
       console.log(`[DocumentService.getContent] pdf-parse extracted ${result.text.length} chars`);
       return result.text;
     }
 
     // Plain text / markdown
-    const text = await res.text();
-    console.log(`[DocumentService.getContent] plain text ${text.length} chars, preview: ${text.slice(0, 200)}`);
+    const text = buffer.toString('utf8');
+    console.log(`[DocumentService.getContent] plain text ${text.length} chars`);
     return text;
   }
 
@@ -254,21 +235,12 @@ class DocumentService {
     const extension = document.filePath.includes('.') ? document.filePath.split('.').pop() : '';
     const newStoragePath = `${targetProjectId}/${folderId || 'root'}/${document.id}${extension ? `.${extension}` : ''}`;
 
-    // copy + remove to simulate move in Supabase storage
+    // Move file locally
     if (document.filePath !== newStoragePath) {
-      const { error: copyError } = await supabase
-        .storage
-        .from(SUPABASE_STORAGE_BUCKET)
-        .copy(document.filePath, newStoragePath);
-
-      if (copyError) {
-        throw new Error(`Failed to move file: ${copyError.message}`);
-      }
-
-      await supabase
-        .storage
-        .from(SUPABASE_STORAGE_BUCKET)
-        .remove([document.filePath]);
+      const oldFullPath = path.join(UPLOADS_DIR, document.filePath);
+      const newFullPath = path.join(UPLOADS_DIR, newStoragePath);
+      await fs.mkdir(path.dirname(newFullPath), { recursive: true });
+      await fs.rename(oldFullPath, newFullPath);
     }
 
     await Document.move(documentId, {
@@ -276,7 +248,7 @@ class DocumentService {
       folderId: folderId || null,
     });
 
-    return Document.update(documentId, { file_path: newStoragePath });
+    return Document.update(documentId, { filePath: newStoragePath });
   }
 
   /**
@@ -293,14 +265,12 @@ class DocumentService {
       await MembershipService.requireProjectRole(user.id, document.projectId, ['owner', 'admin', 'editor']);
     }
 
-    // Delete file from Supabase Storage
+    // Delete file from local disk
     try {
-      await supabase
-        .storage
-        .from(SUPABASE_STORAGE_BUCKET)
-        .remove([document.filePath]);
+      const fullPath = path.join(UPLOADS_DIR, document.filePath);
+      await fs.unlink(fullPath);
     } catch (error) {
-      console.warn('[DocumentService] File not found in storage:', document.filePath);
+      console.warn('[DocumentService] File not found in local storage:', document.filePath);
     }
 
     await Document.delete(documentId);

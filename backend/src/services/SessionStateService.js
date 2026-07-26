@@ -1,5 +1,4 @@
 const SessionState = require('../models/SessionState');
-const MembershipService = require('./MembershipService');
 const { ApiError } = require('../middleware/errorHandler');
 
 /**
@@ -12,7 +11,6 @@ class SessionStateService {
   async saveState({ page, selectedDocIds, taskId, metadata, user }) {
     const projectId = metadata?.projectId;
     if (!projectId) throw new ApiError(400, 'metadata.projectId is required');
-    await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer']);
     return SessionState.upsert({
       page,
       userId: user.id,
@@ -28,7 +26,6 @@ class SessionStateService {
    */
   async getState(page, user, projectId) {
     if (!projectId) throw new ApiError(400, 'project_id is required');
-    await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer']);
     return SessionState.findByPage(page, user.id, projectId);
   }
 
@@ -36,9 +33,6 @@ class SessionStateService {
    * Clear session state for a page
    */
   async clearState(page, user, projectId = null) {
-    if (projectId) {
-      await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer']);
-    }
     return SessionState.deleteByPage(page, user.id, projectId);
   }
 
@@ -51,3 +45,4 @@ class SessionStateService {
 }
 
 module.exports = new SessionStateService();
+

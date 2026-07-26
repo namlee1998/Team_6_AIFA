@@ -1,8 +1,7 @@
-import { ArrowLeft, Compass, Home, LayoutDashboard, LogIn } from 'lucide-react';
+import { ArrowLeft, Compass, LayoutDashboard } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { cn } from '@/lib/utils';
-import { useAuthStore } from '@/store/useAuthStore';
 
 interface NotFoundPageProps {
   mode?: 'screen' | 'panel';
@@ -11,10 +10,8 @@ interface NotFoundPageProps {
 export function NotFoundPage({ mode = 'screen' }: NotFoundPageProps) {
   const navigate = useNavigate();
   const { t } = useTranslation();
-  const { session } = useAuthStore();
-  const isAuthenticated = Boolean(session);
-  const primaryPath = isAuthenticated ? '/app' : '/auth';
-  const PrimaryIcon = isAuthenticated ? LayoutDashboard : LogIn;
+  const primaryPath = '/sdlc';
+  const PrimaryIcon = LayoutDashboard;
 
   return (
     <div
@@ -47,20 +44,12 @@ export function NotFoundPage({ mode = 'screen' }: NotFoundPageProps) {
             className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-5 py-3 text-sm font-bold text-on-primary shadow-lg shadow-primary/20 transition-transform hover:scale-[1.02] active:scale-[0.98] sm:w-auto"
           >
             <PrimaryIcon className="h-4 w-4" aria-hidden="true" />
-            {isAuthenticated ? t('notFound.goToApp') : t('notFound.signIn')}
-          </button>
-          <button
-            type="button"
-            onClick={() => navigate('/')}
-            className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-outline-variant/30 bg-surface-container-low px-5 py-3 text-sm font-bold text-on-surface transition-colors hover:bg-surface-container sm:w-auto"
-          >
-            <Home className="h-4 w-4" aria-hidden="true" />
-            {t('notFound.goHome')}
+            {t('notFound.goToApp')}
           </button>
           <button
             type="button"
             onClick={() => navigate(-1)}
-            className="inline-flex w-full items-center justify-center gap-2 rounded-xl px-5 py-3 text-sm font-bold text-on-surface-variant transition-colors hover:bg-surface-container-low hover:text-on-surface sm:w-auto"
+            className="inline-flex w-full items-center justify-center gap-2 rounded-xl border border-outline-variant/30 bg-surface-container-low px-5 py-3 text-sm font-bold text-on-surface transition-colors hover:bg-surface-container sm:w-auto"
           >
             <ArrowLeft className="h-4 w-4" aria-hidden="true" />
             {t('notFound.goBack')}

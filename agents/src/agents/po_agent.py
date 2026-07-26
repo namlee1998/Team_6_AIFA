@@ -1,12 +1,15 @@
-"""
-PO Agent — Generates PRD, User Stories, Acceptance Criteria, and Scope
-from a Feature Request + Project Context.
+"""PO worker: turn a feature request into product artifacts.
+
+Beginner reading guide: build the prompt, optionally call mock MCP tools, invoke
+the configured chat model, parse strict JSON, and return POAgentOutput. Backend
+validation decides whether these artifacts may be handed to UX/DEV.
 """
 from __future__ import annotations
 import json
 import logging
 import os
 import re
+import asyncio
 from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -50,16 +53,7 @@ Output ONLY valid JSON with keys: prd, user_stories, acceptance_criteria, scope,
 No extra text outside the JSON block.
 """
 
-def _get_llm(model_config: dict | None = None) -> ChatOpenAI:
-    model_config = model_config or {}
-    model_name = model_config.get("model") or os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
-    return ChatOpenAI(
-        model=model_name,
-        temperature=model_config.get("temperature", 0.2),
-        max_tokens=model_config.get("max_tokens", 8192),
-        api_key=os.getenv("OPENAI_API_KEY", ""),
-        base_url=os.getenv("OPENAI_API_BASE") or None,
-    )
+from src.utils.llm_factory import get_llm as _get_llm
 
 def _parse_po_output(raw: str) -> dict:
     """Extract JSON from LLM output, stripping markdown fences."""
@@ -69,10 +63,8 @@ def _parse_po_output(raw: str) -> dict:
         text = fence.group(1).strip()
     try:
         return json.loads(text)
-    except Exception:
-        # Best-effort: return minimal structure
-        logger.warning("[POAgent] Failed to parse JSON, returning raw as prd")
-        return {"prd": raw, "user_stories": [], "acceptance_criteria": [], "scope": "", "out_of_scope": "", "summary": ""}
+    except Exception as e:
+        raise ValueError(f"Agent generated invalid JSON: {str(e)}\nRaw output: {raw}")
 
 async def run_po_agent(
     input_data: POAgentInput,
@@ -100,6 +92,8 @@ Project Context:
 """
     if input_data.feedback_prompt:
         user_content = f"<human_feedback>\n{input_data.feedback_prompt}\n</human_feedback>\n\n{user_content}"
+    if input_data.previous_draft:
+        user_content += f"\n\n<previous_draft>\n{input_data.previous_draft}\n</previous_draft>\n<instruction>\nYou MUST use the previous_draft as your baseline. Only apply changes requested in the human_feedback. Do not rewrite perfectly good sections unnecessarily.\n</instruction>"
 
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=user_content)]
     config = trace_context.langchain_config("po_agent") if trace_context else None
@@ -139,7 +133,7 @@ async def stream_po_agent(
     llm = _get_llm(model_config)
     fr = input_data.feature_request
     pc = input_data.project_context
-    mcp_activity = _prepare_po_mcp(fr.title)
+    mcp_activity = await asyncio.to_thread(_prepare_po_mcp, fr.title)
     yield {"event": "progress", "data": {"step": "mcp", "token": "PO called MCP tool: docs.search"}}
 
     user_content = f"""Feature Request:
@@ -157,6 +151,8 @@ Project Context:
 """
     if input_data.feedback_prompt:
         user_content = f"<human_feedback>\n{input_data.feedback_prompt}\n</human_feedback>\n\n{user_content}"
+    if input_data.previous_draft:
+        user_content += f"\n\n<previous_draft>\n{input_data.previous_draft}\n</previous_draft>\n<instruction>\nYou MUST use the previous_draft as your baseline. Only apply changes requested in the human_feedback. Do not rewrite perfectly good sections unnecessarily.\n</instruction>"
 
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=user_content)]
     config = trace_context.langchain_config("po_agent") if trace_context else None
@@ -165,10 +161,11 @@ Project Context:
     retries = 0
     parsed = None
     
+    total_input = 0
+    total_output = 0
+    
     while retries < max_retries:
         full_text = ""
-        total_input = 0
-        total_output = 0
         
         if retries > 0:
             yield {"event": "progress", "data": {"step": "schema_gate", "token": f"\n\n🔄 Schema validation failed. Retrying JSON generation (Attempt {retries}/{max_retries})...\n\n"}}
@@ -210,7 +207,7 @@ Project Context:
             else:
                 messages.append(SystemMessage(content=f"Your last output was invalid JSON. Error: {str(e)}. Please output ONLY valid JSON."))
 
-    parsed["mcp_activity"] = _publish_po_mcp(fr.title, parsed.get("prd", ""), mcp_activity)
+    parsed["mcp_activity"] = await asyncio.to_thread(_publish_po_mcp, fr.title, parsed.get("prd", ""), mcp_activity)
     yield {"event": "progress", "data": {"step": "mcp", "token": "PO called MCP tool: confluence.write"}}
     yield {
         "event": "completed",

@@ -226,6 +226,10 @@ class RunAgentRequest(BaseModel):
         default_factory=dict,
         description="Context data sẽ được chuyển thành input của agent tương ứng",
     )
+    auto_approve: bool = Field(
+        default=False,
+        description="Nếu True, LangGraph sẽ bỏ qua Breakpoint và tự động chạy Tool (Rảnh tay).",
+    )
 
 
 class StreamChunk(BaseModel):
