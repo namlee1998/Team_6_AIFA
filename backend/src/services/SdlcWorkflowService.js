@@ -122,7 +122,8 @@ class SdlcWorkflowService {
    * Start a PO Agent run — reads intent assumptions, produces PRD artifacts.
    */
   async runPOAgent({ projectId, sourceTaskId = null, featureRequest = null, feedbackPrompt = '', previousDraft = null, backlogId = null,
-    repoUrl = null, repoPath = null, branch = 'main', request = '', sessionId = null, user }) {
+    repoUrl = null, repoPath = null, branch = 'main', request = '', sessionId = null,
+    architectureInputPath = null, autoApproveOutputReview = false, stopAfterAgent = null, user }) {
     const deps = {
       MembershipService,
       contentHash,
@@ -132,7 +133,8 @@ class SdlcWorkflowService {
     };
     return workflowOrchestrator.runPOAgent({
       projectId, sourceTaskId, featureRequest, feedbackPrompt, previousDraft, backlogId,
-      repoUrl, repoPath, branch, request, sessionId, user,
+      repoUrl, repoPath, branch, request, sessionId,
+      architectureInputPath, autoApproveOutputReview, stopAfterAgent, user,
     }, deps);
   }
 
@@ -1947,7 +1949,6 @@ class SdlcWorkflowService {
         // workspace artifact still exists.
         if (artType === 'architecture_contract' && task.sessionId) {
           try {
-            const repoService = require('./repoService');
             const sessionRepo = await repoService.getSessionRepoInfo({
               projectId: task.projectId,
               sessionId: task.sessionId,
@@ -1978,6 +1979,38 @@ class SdlcWorkflowService {
           contentJson: typeof content === 'object' ? { file_path: fileRef.slice(5) } : null,
           ordinal: artifactTypes.indexOf(artType),
           contentHash: contentHash(content),
+        });
+      }
+    }
+
+    // PO owns one canonical agent-io bundle. Persist its five fields normally
+    // above, then mirror that same bundle as one repository artifact so the
+    // approval commit has exactly one PO-owned file to stage.
+    if (task.type === 'po-agent' && task.sessionId) {
+      const productSpec = {
+        prd: completedData.prd,
+        user_stories: completedData.user_stories,
+        acceptance_criteria: completedData.acceptance_criteria,
+        scope: completedData.scope,
+        out_of_scope: completedData.out_of_scope,
+      };
+      try {
+        const sessionRepo = await repoService.getSessionRepoInfo({
+          projectId: task.projectId,
+          sessionId: task.sessionId,
+        }).catch(() => null);
+        if (sessionRepo?.repoPath) {
+          const mirrorDir = path.join(sessionRepo.repoPath, '.aifa');
+          await fs.mkdir(mirrorDir, { recursive: true });
+          await fs.writeFile(
+            path.join(mirrorDir, 'product-spec.json'),
+            JSON.stringify(productSpec, null, 2),
+            'utf8',
+          );
+        }
+      } catch (mirrorErr) {
+        logger.warn('PO product-spec mirror into repo failed (non-fatal)', {
+          taskId: task.id, error: mirrorErr.message,
         });
       }
     }
@@ -2044,6 +2077,11 @@ class SdlcWorkflowService {
     // in-place on resolve. There is exactly one canonical path; we no longer
     // create a question gate here, rerun the agent, or create a new task.
 
+    const persisted = await Task.findById(task.id);
+    const poAutoApprove = task.type === 'po-agent'
+      && persisted?.observability?.autoApproveOutputReview === true;
+    const resolvedGateMode = poAutoApprove ? GATE_MODE.AUTO_SAFE : this._resolveGateMode(task);
+
     await Task.update(task.id, {
       status: 'completed',
       output_content_hash: outputHash,
@@ -2052,7 +2090,7 @@ class SdlcWorkflowService {
       // Structured HITL (plan 2.4): keep the raw agent output distinct from the
       // human-approved output. approvedOutput is only set on approve/edit.
       agentOutput: completedData,
-      gateMode: this._resolveGateMode(task),
+      gateMode: resolvedGateMode,
     });
     // Race window: an execution-time timeout may have already moved this
     // task to a terminal executionStatus (`timeout`) while the SDK was
@@ -2090,7 +2128,7 @@ class SdlcWorkflowService {
     // never silently auto-advances. Reject re-runs the same agent with the
     // human's reason as feedback (see resolveOutputReviewGate).
     if (AGENT_GATES[task.type]) {
-      const { approvalId } = gateBridge.requestGate({
+      const { approvalId, ready } = gateBridge.requestGate({
         taskId: task.id,
         sessionId: task.sessionId,
         projectId: task.projectId,
@@ -2113,6 +2151,19 @@ class SdlcWorkflowService {
         approvalId,
         invalid: blockers.length > 0,
       });
+      if (poAutoApprove) {
+        await ready;
+        const approved = await this._autoApproveSafeOutput(task.id, userId, {
+          approvalId,
+          stopAfterAgent: persisted.observability?.stopAfterAgent || null,
+        });
+        if (!approved) {
+          logger.warn('PO happy-path auto approval did not pass the existing gate policy', {
+            taskId: task.id,
+            approvalId,
+          });
+        }
+      }
     }
 
     if (userId) {
@@ -2142,7 +2193,7 @@ class SdlcWorkflowService {
     return workflowHelpers.resolveGateMode(task);
   }
 
-  async _autoApproveSafeOutput(taskId, userId = null) {
+  async _autoApproveSafeOutput(taskId, userId = null, { approvalId = null, stopAfterAgent = null } = {}) {
     const task = await Task.findById(taskId);
     if (!task || task.gateMode === GATE_MODE.STRICT_MANUAL) return false;
 
@@ -2151,8 +2202,33 @@ class SdlcWorkflowService {
     if (evaluation.recommendation !== 'PASS') return false;
     const { confidence, validation } = evaluation;
 
+    if (approvalId) {
+      const pending = gateBridge.getPending(approvalId);
+      if (!pending || pending.taskId !== task.id || pending.kind !== 'output_review') return false;
+      await gateBridge.resolveGate(approvalId, {
+        action: 'approve',
+        comment: 'Auto-approved by PO happy-path demo after validation passed',
+      });
+    }
+
     await Task.update(task.id, { approvedOutput: output, version_status: 'committed' });
     await Task.commitTask(task.id);
+    await AgentArtifact.setStatusByTaskId(task.id, 'VALID');
+    const commitResult = await repoService.commitAndPushOnApprove({
+      task,
+      onLog: (message, meta = {}) => {
+        publishEvent('runtime_log',
+          { projectId: task.projectId, sessionId: task.sessionId, taskId: task.id, role: null },
+          {
+            taskId: task.id,
+            level: meta.level || 'info',
+            source: 'auto_commit',
+            message,
+            meta,
+          },
+        );
+      },
+    });
     const approval = await HitlDecision.create({
       id: uuidv4(),
       taskId: task.id,
@@ -2164,21 +2240,38 @@ class SdlcWorkflowService {
       decisionId: uuidv4(),
       baseOutputVersion: task.outputVersion || 0,
       comment: `Auto-approved: confidence ${confidence.toFixed(2)}, validation passed`,
-      payload: { confidence, threshold: AUTO_APPROVE_CONFIDENCE, validation },
+      payload: {
+        approvalId,
+        confidence,
+        threshold: AUTO_APPROVE_CONFIDENCE,
+        validation,
+        commit: commitResult,
+        stopAfterAgent,
+      },
     });
     const refreshed = await Task.findById(task.id);
+    await Task.update(task.id, {
+      observability: {
+        ...(refreshed.observability || {}),
+        outputReviewApprovalId: approvalId,
+        autoApprovalId: approval.id,
+        commit: commitResult,
+      },
+    });
     await this._recordApprovedHandoff(refreshed, approval);
-    try {
-      await this._startNextAgentIfAvailable(refreshed, userId);
-    } catch (err) {
-      // A downstream startup failure must not turn an already completed and
-      // committed upstream task into FAILED.
-      logger.error('downstream agent failed to start after auto-approval', {
-        sourceTaskId: refreshed.id,
-        sourceAgent: refreshed.type,
-        nextAgent: this._nextAgentFor(refreshed),
-        error: err.message,
-      });
+    if (stopAfterAgent !== refreshed.type) {
+      try {
+        await this._startNextAgentIfAvailable(refreshed, userId);
+      } catch (err) {
+        // A downstream startup failure must not turn an already completed and
+        // committed upstream task into FAILED.
+        logger.error('downstream agent failed to start after auto-approval', {
+          sourceTaskId: refreshed.id,
+          sourceAgent: refreshed.type,
+          nextAgent: this._nextAgentFor(refreshed),
+          error: err.message,
+        });
+      }
     }
     return true;
   }
