@@ -22,7 +22,7 @@
 
 const fs = require('fs/promises');
 const path = require('path');
-const { REQUIRED_OUTPUT_KEYS, AGENT_CONTRACT_VERSION, assertOutputConforms } = require('../services/agentContract');
+const { REQUIRED_OUTPUT_KEYS, AGENT_CONTRACT_VERSION, assertOutputConforms, hasContent } = require('../services/agentContract');
 
 const PROMPT_DIR = path.join(__dirname, 'prompts');
 const DEFAULT_TIMEOUT_MS = Number(process.env.CLAUDE_CODE_TIMEOUT_MS) || 30 * 60 * 1000;
@@ -92,35 +92,31 @@ function compactContext(role, context = {}) {
     'architecture-agent': ['featureRequest', 'feedbackPrompt', 'repoContext', 'repoIndex', 'scopeHints'],
     'po-agent': [
       'featureRequest', 'feedbackPrompt',
-      // project_definition is the canonical A2A contract from Architecture
+      // architecture_contract is the canonical A2A contract from Architecture
       // (docs/architecture/A2A_PIPELINE_REDESIGN.md §4). PO/UX/DEV/QA all
-      // receive it as a structured object. architecture_brief is kept as
-      // derived documentation for one phase (to be removed in Phase 3).
-      'project_definition',
-      'architecture_brief',
+      // receive it as a structured object.
+      'architecture_contract',
     ],
     'ux-agent': [
       'prd', 'user_stories', 'acceptance_criteria', 'risk_classification',
       'feedbackPrompt',
-      'project_definition',
+      'architecture_contract',
     ],
     'dev-agent': [
       'prd', 'acceptance_criteria', 'risk_classification', 'ux_spec',
       'user_flow', 'wireframe_spec', 'component_inventory',
       'screens', 'color_palette', 'typography',
       'feedbackPrompt', 'repoContext',
-      'project_definition',
-      'architecture_brief',
+      'architecture_contract',
     ],
     'qa-agent': [
       'acceptance_criteria', 'risk_classification', 'ux_spec', 'implementation_plan',
       'patch_diff', 'mock_code_diff', 'changed_files', 'build_result',
       'self_test_report', 'risk_assessment', 'security_notes', 'security_gate',
       'feedbackPrompt', 'repoContext',
-      // Phase 2: QA receives project_definition so it can pick test
-      // runner / environment / scope from the canonical tech-stack fields.
-      // QA prompt itself is not modified in Phase 2.
-      'project_definition',
+      // QA receives architecture_contract so it can pick test runner /
+      // environment / scope from the canonical tech-stack fields.
+      'architecture_contract',
     ],
   }[role] || Object.keys(context);
   return Object.fromEntries(allowed.filter((key) => context[key] !== undefined).map((key) => [key, context[key]]));
@@ -288,6 +284,36 @@ function coerceArrayFields(role, output) {
   return output;
 }
 
+// Collapse the legacy architecture-agent output (project_definition + 6
+// derived fields) to a single `architecture_contract` key. Old runs and
+// prompts may still emit `project_definition`; alias it forward so the
+// strict contract check accepts both spellings, then drop the 6 derived
+// fields so the artifact manager persists exactly one row.
+const ARCH_DERIVED_KEYS = [
+  'architecture_brief',
+  'repository_summary',
+  'technology_stack',
+  'technical_decisions',
+  'constraints',
+  'repository_routing',
+];
+function collapseArchitectureOutput(output) {
+  if (!output || typeof output !== 'object') return output;
+  // Already canonical — only strip derived fields that some old prompt may
+  // still emit alongside the new key.
+  if (output.architecture_contract && hasContent(output.architecture_contract)) {
+    for (const key of ARCH_DERIVED_KEYS) delete output[key];
+    return output;
+  }
+  // Alias the legacy `project_definition` key forward to the canonical name.
+  if (output.project_definition && !output.architecture_contract) {
+    output.architecture_contract = output.project_definition;
+    delete output.project_definition;
+  }
+  for (const key of ARCH_DERIVED_KEYS) delete output[key];
+  return output;
+}
+
 function normalizeOutput(role, parsed, meta = {}) {
   const envelope = parsed.outputVersion || parsed.schema_version || parsed.stage || parsed.artifact
     ? parsed
@@ -314,6 +340,9 @@ function normalizeOutput(role, parsed, meta = {}) {
 
   // Reshape known list fields (string→array) so the gate's array checks pass.
   coerceArrayFields(role, output);
+  // Collapse the legacy 7-key architecture-agent output to the single
+  // `architecture_contract` key the new contract requires. Idempotent.
+  if (role === 'architecture-agent') collapseArchitectureOutput(output);
   // Phase 3.6: DEV no longer emits risk_classification / security_notes /
   // security_gate. Those fields are QA-only canonical. The promotion block
   // was removed; real QA runs surface security evidence directly.

@@ -31,7 +31,7 @@ const PREDECESSOR_ROLE = {
 const MAX_PARALLEL_WORKFLOWS = () => Math.max(1, Number(process.env.MAX_PARALLEL_WORKFLOWS) || 4);
 
 // Phase 2 plumbing (docs/architecture/A2A_PIPELINE_REDESIGN.md §8 Phase 2):
-// Resolve a JSON-object artifact (currently only `project_definition`) from
+// Resolve a JSON-object artifact (currently only `architecture_contract`) from
 // the upstream task and return it as a structured object ready for
 // `buildContextFromArtifacts` extras. Returns null when the artifact is
 // absent or empty, so callers can safely spread the result.
@@ -369,19 +369,16 @@ async function runPOAgent(params, deps) {
     }
   }
 
-  const architecture_brief = sourceArtifacts.find((a) => a.artifactType === 'architecture_brief')?.contentText || null;
-
-  // Phase 2: resolve the canonical `project_definition` artifact from the
-  // ARCH task and inject it as a flat object into the PO context. PO's
-  // `compactContext` whitelist (claudeCodeRunner.js) now includes
-  // `project_definition`, so the value flows into the AIFA Context as a
+  // Phase 2: resolve the canonical `architecture_contract` artifact (alias of
+  // the former project_definition) from the ARCH task and inject it as a flat
+  // object into the PO context. PO's `compactContext` whitelist
+  // (claudeCodeRunner.js) carries the value into the AIFA Context as a
   // structured object — no prompt change required.
-  const projectDefinition = await resolveStructuredArtifact(sourceArtifacts, 'project_definition', deps);
+  const architectureContract = await resolveStructuredArtifact(sourceArtifacts, 'architecture_contract', deps);
 
   const context = await deps.buildContextFromArtifacts(sourceArtifacts, {
     feedbackPrompt,
-    architecture_brief,
-    ...(projectDefinition ? { project_definition: projectDefinition } : {}),
+    ...(architectureContract ? { architecture_contract: architectureContract } : {}),
     ...(previousDraft ? { previousDraft } : {}),
     ...(featureRequest ? { featureRequest } : {}),
   });
@@ -401,9 +398,9 @@ async function runUXAgent(params, deps) {
   await requireUpstreamArtifact(sourceTask, 'ux-agent');
 
   // B16: mirror runQAAgent — also load Architecture artifacts so UX receives
-  // the canonical `project_definition` + `architecture_brief` per the
-  // a2a_handoff envelope contract (artifactManager.js:113-122). Without this
-  // UX sees only PO artifacts and self-reports the missing project_definition.
+  // the canonical `architecture_contract` per the a2a_handoff envelope
+  // contract (artifactManager.js:113-122). Without this UX sees only PO
+  // artifacts and self-reports the missing architecture_contract.
   const archTask = await Task.findLatestBySession(
     sourceTask.sessionId,
     'architecture-agent',
@@ -411,11 +408,11 @@ async function runUXAgent(params, deps) {
     'committed',
   );
 
-  const [archProjectDefinition, archArtifacts, poArtifacts] = await Promise.all([
+  const [archArchitectureContract, archArtifacts, poArtifacts] = await Promise.all([
     archTask
       ? resolveStructuredArtifact(
           await AgentArtifact.findByTaskId(archTask.id),
-          'project_definition',
+          'architecture_contract',
           deps,
         )
       : Promise.resolve(null),
@@ -451,7 +448,7 @@ async function runUXAgent(params, deps) {
   const repoContext = deps.getRepoContext ? await deps.getRepoContext(task.projectId, task.sessionId) : null;
   const context = await deps.buildContextFromArtifacts(allArtifacts, {
     feedbackPrompt,
-    ...(archProjectDefinition ? { project_definition: archProjectDefinition } : {}),
+    ...(archArchitectureContract ? { architecture_contract: archArchitectureContract } : {}),
     ...(repoContext ? { repoContext } : {}),
     ...(previousDraft ? { previousDraft } : {}),
   });
@@ -494,13 +491,9 @@ async function runDEVAgent(params, deps) {
     versionStatus: 'draft',
   });
 
-  const architecture_brief = [...poArtifacts, ...uxArtifacts]
-    .find((a) => a.artifactType === 'architecture_brief')?.contentText || null;
-
   const repoContext = deps.getRepoContext ? await deps.getRepoContext(task.projectId, task.sessionId) : null;
   const context = await deps.buildContextFromArtifacts([...poArtifacts, ...uxArtifacts], {
     feedbackPrompt,
-    architecture_brief,
     ...(repoContext ? { repoContext } : {}),
     ...(previousDraft ? { previousDraft } : {}),
   });
@@ -534,17 +527,17 @@ async function runQAAgent(params, deps) {
     Task.findLatestBySession(sourceTask.sessionId, 'po-agent', 'completed', 'committed'),
     Task.findLatestBySession(sourceTask.sessionId, 'ux-agent', 'completed', 'committed'),
     // Phase 2: also surface the ARCH (architecture-agent) task so QA can
-    // reach `project_definition` across the whole ARCH → PO → UX → DEV → QA
+    // reach `architecture_contract` across the whole ARCH → PO → UX → DEV → QA
     // chain (QA's chain predecessor is DEV, but the canonical A2A
     // contract originates from ARCH).
     Task.findLatestBySession(sourceTask.sessionId, 'architecture-agent', 'completed', 'committed'),
   ]);
 
-  const [archProjectDefinition, archArtifacts] = archTask
+  const [archArchitectureContract, archArtifacts] = archTask
     ? await Promise.all([
         resolveStructuredArtifact(
           await AgentArtifact.findByTaskId(archTask.id),
-          'project_definition',
+          'architecture_contract',
           deps,
         ),
         AgentArtifact.findByTaskId(archTask.id),
@@ -581,7 +574,7 @@ async function runQAAgent(params, deps) {
   const repoContext = deps.getRepoContext ? await deps.getRepoContext(task.projectId, task.sessionId) : null;
   const context = await deps.buildContextFromArtifacts(allArtifacts, {
     feedbackPrompt,
-    ...(archProjectDefinition ? { project_definition: archProjectDefinition } : {}),
+    ...(archArchitectureContract ? { architecture_contract: archArchitectureContract } : {}),
     ...(repoContext ? { repoContext } : {}),
     ...(previousDraft ? { previousDraft } : {}),
   });

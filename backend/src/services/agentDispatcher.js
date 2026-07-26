@@ -65,11 +65,15 @@ async function buildMockOutput(task, context, deps = {}) {
         ? scopeHints.ignoreGlobs.slice(0, 8)
         : ['node_modules/', 'dist/', 'build/'];
 
-      // Project Definition (A2A Contract) — every mandatory field carries
+      // Architecture Contract (A2A Contract) — every mandatory field carries
       // {value, source, status} metadata so the BLOCKER validators can
       // accept it deterministically. assumptions is allowed status='assumed'
-      // because it is optional.
-      const project_definition = {
+      // because it is optional. This is the SINGLE artifact the
+      // architecture-agent now emits; the 6 legacy derived fields
+      // (architecture_brief, repository_summary, technology_stack,
+      // technical_decisions, top-level constraints, repository_routing)
+      // have been collapsed into this object.
+      const architecture_contract = {
         project_type:      { value: 'web_app',                                          source: 'agent',    status: 'confirmed' },
         language:          { value: languageHint,                                       source: 'inferred', status: 'confirmed' },
         framework:         { value: 'unknown',                                          source: 'agent',    status: 'confirmed' },
@@ -84,35 +88,8 @@ async function buildMockOutput(task, context, deps = {}) {
       };
 
       return {
-        // The A2A Contract — sole required structured output for ARCH.
-        project_definition,
-        // Derived fields kept for FE / human-review backward compat.
-        repository_summary: { overview: 'Mock repository summary generated for contract validation.', entrypoints: [], notes: '' },
-        technology_stack: { language: languageHint, framework: 'unknown', package_manager: 'npm', runtime: 'unknown' },
-        technical_decisions: ['Mock decision generated for contract validation.'],
-        constraints: ['Mock constraint generated for contract validation.'],
-        repository_routing: {
-          target_module: primary,
-          framework: 'unknown',
-          language: languageHint,
-          search_scope: targetFolders.join(','),
-          ignore: ignoreGlobs,
-          confidence: typeof scopeHints?.confidence === 'number' ? scopeHints.confidence : 0.5,
-        },
-        architecture_brief: [
-          '# Mock Architecture Brief',
-          '',
-          'Generated for contract validation. Routing is provisional; downstream agents should re-validate against the live repository tree before planning.',
-          '',
-          '## Module routing',
-          `- Target module: \`${primary}\``,
-          '- Framework: unknown (fallback)',
-          `- Language: ${languageHint} (fallback)`,
-          '',
-          '## Constraints',
-          '- Preserve existing behavior outside the requested scope.',
-          '- Validate routing decisions at the architecture review gate.',
-        ].join('\n'),
+        // The A2A Contract — sole structured output for ARCH.
+        architecture_contract,
       };
     })(),
     'po-agent': {
@@ -165,19 +142,30 @@ async function buildMockOutput(task, context, deps = {}) {
     }
   });
 
-  if (['architecture-agent', 'po-agent'].includes(task.type) && context.featureRequest) {
+  // Phase A: architecture-agent persists ONLY architecture_contract. Do NOT
+  // inject feature_request for the architecture fallback — it would produce a
+  // second persisted artifact row. Downstream PO seeding of feature_request
+  // is a Phase B consumer concern and must not bleed into Architecture
+  // persistence.
+  if (task.type === 'po-agent' && context.featureRequest) {
     completedData.feature_request = context.featureRequest;
   }
-  if (task.type === 'architecture-agent' && !hasContent(completedData.architecture_brief)) {
+  if (task.type === 'architecture-agent' && !hasContent(completedData.architecture_contract)) {
     const feature = context.featureRequest || {};
-    completedData.architecture_brief = [
-      `# Architecture brief: ${feature.title || 'Requested feature'}`,
-      '',
-      feature.description || 'The requested feature must be analyzed against the repository before planning.',
-      '',
-      '- Preserve existing behavior outside the requested scope.',
-      '- Validate routing decisions at the architecture review gate.',
-    ].join('\n');
+    const fallbackContract = {
+      project_type:      { value: 'web_app',                                          source: 'agent',    status: 'assumed' },
+      language:          { value: context.scopeHints?.languageHint || 'unknown',       source: 'inferred', status: 'assumed' },
+      framework:         { value: 'unknown',                                          source: 'agent',    status: 'assumed' },
+      runtime:           { value: 'unknown',                                          source: 'agent',    status: 'assumed' },
+      package_manager:   { value: 'npm',                                              source: 'inferred', status: 'assumed' },
+      build_system:      { value: 'npm scripts',                                      source: 'inferred', status: 'assumed' },
+      deployment_target: { value: 'node-server',                                      source: 'agent',    status: 'assumed' },
+      repository:        { value: { target_module: 'src/', search_scope: 'src/' },     source: 'agent',    status: 'assumed' },
+      constraints:       { value: [feature.description || 'Preserve existing behavior outside the requested scope.'], source: 'agent', status: 'assumed' },
+      out_of_scope:      { value: ['Explicitly excluded by user.'],                   source: 'agent',    status: 'assumed' },
+      assumptions:       { value: [`# Architecture contract fallback: ${feature.title || 'Requested feature'}`, '', feature.description || '', '- Validate routing decisions at the architecture review gate.'], source: 'agent', status: 'assumed' },
+    };
+    completedData.architecture_contract = fallbackContract;
     completedData.clarifying_questions = completedData.clarifying_questions || [];
   }
 
@@ -444,7 +432,11 @@ async function runAgent(task, context, userId = null, deps = {}) {
           return;
         }
         if (!completedData) throw new Error('Agent returned no data');
-        if (['architecture-agent', 'po-agent'].includes(task.type) && context.featureRequest) {
+        // Phase A: architecture-agent persists ONLY architecture_contract.
+        // Mirrors the mock-path narrowing above so both execution paths honor
+        // the single-artifact contract. Downstream PO seeding of
+        // feature_request is a Phase B consumer concern.
+        if (task.type === 'po-agent' && context.featureRequest) {
           completedData.feature_request = context.featureRequest;
         }
         const conformance = assertOutputConforms(task.type, completedData);

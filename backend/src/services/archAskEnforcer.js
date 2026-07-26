@@ -36,14 +36,14 @@ const ENFORCED_ROLES = new Set([
 
 function _violationFields(role, violations) {
   // violations: [{rule, severity, detail, ...}]
-  // For ARCH we map rule suffixes back to project_definition field names so
+  // For ARCH we map rule suffixes back to architecture_contract field names so
   // the feedback prompt can list them by semantic key. For non-ARCH roles
   // the validator rule names already name the missing field directly.
   const fields = [];
   for (const v of violations) {
     const r = v.rule || '';
     if (role === ARCH_TYPE) {
-      if (r.endsWith('_missing') && r !== 'project_definition_present') {
+      if (r.endsWith('_missing') && r !== 'architecture_contract_present') {
         const key = r.slice(0, -'_missing'.length);
         if (key !== 'repository') {
           fields.push({ key, kind: 'missing' });
@@ -55,8 +55,8 @@ function _violationFields(role, violations) {
         fields.push({ key, kind: 'assumed' });
       } else if (r === 'repository_target_module_missing') {
         fields.push({ key: 'repository.target_module', kind: 'missing' });
-      } else if (r === 'project_definition_present') {
-        fields.push({ key: 'project_definition', kind: 'missing' });
+      } else if (r === 'architecture_contract_present') {
+        fields.push({ key: 'architecture_contract', kind: 'missing' });
       }
     } else {
       // Plain string list of failing rules for non-ARCH roles.

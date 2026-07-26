@@ -532,36 +532,11 @@ async function commitAndPushOnApprove({ task, runId, onLog } = {}) {
     return result;
   }
 
-  // 2. push (best-effort). Read GH_TOKEN from env at call time, not module load.
-  const token = process.env.GH_TOKEN;
-  if (!token) {
-    result.pushError = 'GH_TOKEN not set — skipping push (commit retained locally)';
-    log(result.pushError, { level: 'warn' });
-    return result;
-  }
-
-  try {
-    const remoteUrl = (await git(['config', '--get', 'remote.origin.url'], repoPath).catch(() => '') || '').trim();
-    if (!remoteUrl) {
-      result.pushError = 'no remote origin configured — skipping push';
-      log(result.pushError, { level: 'warn' });
-      return result;
-    }
-    if (!remoteUrl.startsWith('https://')) {
-      result.pushError = `unsupported remote scheme (${remoteUrl.split('://')[0]}://) — skipping push`;
-      log(result.pushError, { level: 'warn' });
-      return result;
-    }
-    const authUrl = remoteUrl.replace('https://', `https://${token}@`);
-    const pushOutput = await git(['push', authUrl, 'HEAD'], repoPath);
-    const safeOutput = String(pushOutput || '').replace(new RegExp(token, 'g'), '[HIDDEN_TOKEN]');
-    result.pushed = true;
-    log(`auto-push ok: ${safeOutput.split('\n')[0] || 'pushed'}`, { level: 'info' });
-  } catch (err) {
-    const raw = String(err?.message || 'unknown push error');
-    result.pushError = raw.replace(new RegExp(token, 'g'), '[HIDDEN_TOKEN]');
-    log(`auto-push failed: ${result.pushError}`, { level: 'error' });
-  }
+  // 2. push — explicitly NOT executed here. Per spec §7.2 / release flow,
+  // git push only fires from the FINAL_RELEASE gate (releaseManager). The
+  // commit is retained locally; the next-agent wake-up is unaffected.
+  result.pushError = 'push is owned by FINAL_RELEASE gate — skipped here';
+  log('auto-push skipped (commit retained locally; FINAL_RELEASE owns push)', { level: 'info' });
   return result;
 }
 

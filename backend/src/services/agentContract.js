@@ -13,23 +13,16 @@
 
 const AGENT_CONTRACT_VERSION = 'agent-io.v5';
 
-// Project Definition is the A2A Contract for the architecture-agent — the
-// sole required structured output. The legacy fields (architecture_brief,
-// repository_routing, technical_decisions, repository_summary,
-// technology_stack, top-level constraints) are listed below for
-// discoverability, but `assertOutputConforms` treats only `project_definition`
-// as required. The legacy fields remain in the output as human-readable
-// documentation alongside the A2A Contract and are validated as WARNING-only
-// in sdlcConstants.PROJECT_DEFINITION_RULES.
+// architecture-agent emits ONE artifact: `architecture_contract` (alias of the
+// former `project_definition` A2A Contract). The 6 legacy derived fields
+// (architecture_brief, repository_summary, technology_stack,
+// technical_decisions, top-level constraints, repository_routing) have been
+// collapsed: the contract now carries everything downstream agents need and
+// is the only key persisted by the artifact manager. See
+// docs/fixbug/AUDIT_2026_07_25_ARCH_COLLAPSE.md §1.
 const REQUIRED_OUTPUT_KEYS = {
   'architecture-agent': [
-    'project_definition',
-    'architecture_brief',
-    'repository_summary',
-    'technology_stack',
-    'technical_decisions',
-    'constraints',
-    'repository_routing',
+    'architecture_contract',
   ],
   'po-agent': ['prd', 'user_stories', 'acceptance_criteria', 'scope', 'out_of_scope'],
   'ux-agent': ['ux_spec', 'user_flow', 'wireframe_spec', 'screens', 'component_inventory', 'html_mockup'],
@@ -46,11 +39,9 @@ const REQUIRED_OUTPUT_KEYS = {
 };
 
 // Strict subset of REQUIRED_OUTPUT_KEYS that assertOutputConforms must
-// enforce. For most roles this is the same as REQUIRED_OUTPUT_KEYS; for
-// the architecture-agent it is the A2A Contract only — the legacy fields
-// are documentation and tolerate being absent/empty.
+// enforce. For architecture-agent this is the single A2A Contract key.
 const STRICT_OUTPUT_KEYS = {
-  'architecture-agent': ['project_definition'],
+  'architecture-agent': ['architecture_contract'],
 };
 
 // Per spec §6.1: clarification_questions is NOT a post-mortem JSON field.
@@ -120,7 +111,10 @@ function getProjectDefinitionEntry(pd, key) {
 }
 
 /**
- * Validate the project_definition object produced by the Architecture Agent.
+ * Validate the architecture_contract object produced by the Architecture
+ * Agent. The contract is structurally identical to the legacy
+ * project_definition ({value, source, status} per mandatory field), so the
+ * helper name and field names are kept for diff stability.
  *
  * Returns:
  *   {
@@ -142,7 +136,7 @@ function assertProjectDefinitionConforms(pd) {
   if (!pd || typeof pd !== 'object') {
     return {
       ok: false,
-      missing: PROJECT_DEFINITION_MANDATORY_KEYS.map((key) => ({ key, reason: 'project_definition is missing' })),
+      missing: PROJECT_DEFINITION_MANDATORY_KEYS.map((key) => ({ key, reason: 'architecture_contract is missing' })),
       empty: [],
       assumedOnMandatory: [],
     };

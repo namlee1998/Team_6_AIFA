@@ -94,13 +94,14 @@ const _matrix = (o) => (Array.isArray(o.ac_coverage_matrix) ? o.ac_coverage_matr
 // contract iterates rules and calls rule.check(o, task) — so every entry
 // here must expose a `check` function.
 //
-// Project Definition (the A2A contract) is the *primary* structured
-// output. Each mandatory field carries `{value, source, status}` metadata.
-// BLOCKER rules inspect each entry's `status` deterministically; derived
-// fields (architecture_brief, repository_routing, technical_decisions,
-// repository_summary, technology_stack, top-level constraints) are now
-// WARNING-only — they exist as human-readable documentation only and are
-// not read by the pipeline for decisions.
+// Architecture Contract (the A2A contract) is the *only* structured output
+// for the architecture stage. Each mandatory field carries `{value, source,
+// status}` metadata. BLOCKER rules inspect each entry's `status`
+// deterministically. The 6 legacy derived fields (architecture_brief,
+// repository_routing, technical_decisions, repository_summary,
+// technology_stack, top-level constraints) have been removed from the
+// contract: their content was redundant with the contract itself and they
+// caused the artifact manager to persist 7 rows where 1 suffices.
 const PROJECT_DEFINITION_MANDATORY_KEYS = [
   'project_type',
   'language',
@@ -126,14 +127,14 @@ function pdEntryValue(pd, key) {
 }
 
 function _pdFieldMissing(o, key) {
-  const e = pdEntry(o.project_definition, key);
+  const e = pdEntry(o.architecture_contract, key);
   if (!e) return true;
   if (e.status === 'missing') return true;
   return !hasContent(e.value);
 }
 
 function _pdFieldAssumedForbidden(o, key) {
-  const e = pdEntry(o.project_definition, key);
+  const e = pdEntry(o.architecture_contract, key);
   return e && e.status === 'assumed';
 }
 
@@ -220,17 +221,17 @@ function toPhaseStatus(agentName, phaseData, isSkipped = false) {
 
 const PROJECT_DEFINITION_RULES = [
   {
-    rule: 'project_definition_present',
+    rule: 'architecture_contract_present',
     severity: 'BLOCKER',
-    detail: 'project_definition is missing or empty',
-    check: (o) => hasContent(o.project_definition),
+    detail: 'architecture_contract is missing or empty',
+    check: (o) => hasContent(o.architecture_contract),
   },
   // Per-key BLOCKER: each mandatory field must have a non-empty value AND
   // status !== 'missing'.
   ...PROJECT_DEFINITION_MANDATORY_KEYS.map((key) => ({
     rule: `${key}_missing`,
     severity: 'BLOCKER',
-    detail: `project_definition.${key} is missing or has status=missing`,
+    detail: `architecture_contract.${key} is missing or has status=missing`,
     check: (o) => !_pdFieldMissing(o, key),
   })),
   // Mandatory fields may NOT be `assumed`. They must be `confirmed` (user
@@ -240,50 +241,15 @@ const PROJECT_DEFINITION_RULES = [
   ...PROJECT_DEFINITION_MANDATORY_KEYS.map((key) => ({
     rule: `${key}_assumed_forbidden`,
     severity: 'BLOCKER',
-    detail: `project_definition.${key} has status=assumed but is mandatory; AskUserQuestion required`,
+    detail: `architecture_contract.${key} has status=assumed but is mandatory; AskUserQuestion required`,
     check: (o) => !_pdFieldAssumedForbidden(o, key),
   })),
   // Nested: repository.target_module must be present.
   {
     rule: 'repository_target_module_missing',
     severity: 'BLOCKER',
-    detail: 'project_definition.repository.target_module is missing',
-    check: (o) => hasContent(pdEntryValue(o.project_definition, 'repository')?.target_module),
-  },
-  // Derived fields — WARNING only. They exist as human-readable documentation.
-  {
-    rule: 'architecture_brief_present',
-    severity: 'WARNING',
-    detail: 'architecture_brief (derived documentation) is missing',
-    check: (o) => hasContent(o.architecture_brief),
-  },
-  {
-    rule: 'repository_routing_present',
-    severity: 'WARNING',
-    detail: 'repository_routing (derived documentation) is missing',
-    check: (o) => hasContent(o.repository_routing),
-  },
-  {
-    rule: 'technical_decisions_present',
-    severity: 'WARNING',
-    detail: 'technical_decisions (derived documentation) is missing',
-    check: (o) => {
-      const d = o.technical_decisions;
-      if (Array.isArray(d)) return d.length === 0 || d.some((x) => hasContent(x));
-      return hasContent(d);
-    },
-  },
-  {
-    rule: 'repository_summary_present',
-    severity: 'WARNING',
-    detail: 'repository_summary (derived documentation) is missing',
-    check: (o) => hasContent(o.repository_summary),
-  },
-  {
-    rule: 'technology_stack_present',
-    severity: 'WARNING',
-    detail: 'technology_stack (derived documentation) is missing',
-    check: (o) => hasContent(o.technology_stack),
+    detail: 'architecture_contract.repository.target_module is missing',
+    check: (o) => hasContent(pdEntryValue(o.architecture_contract, 'repository')?.target_module),
   },
 ];
 

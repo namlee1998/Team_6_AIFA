@@ -1820,8 +1820,7 @@ class SdlcWorkflowService {
     }
     // Save each artifact returned by the agent
     const artifactRows = [];
-    const artifactTypes = ['feature_request', 'project_definition', 'architecture_brief', 'repository_summary', 'technology_stack',
-      'technical_decisions', 'constraints', 'repository_routing', 'clarifying_questions',
+    const artifactTypes = ['feature_request', 'architecture_contract', 'clarifying_questions',
       'prd', 'user_stories', 'acceptance_criteria', 'scope', 'out_of_scope', 'mcp_activity',
       'assumptions',
       'ux_spec', 'user_flow', 'wireframe_spec', 'component_inventory', 'screens', 'html_mockup',
@@ -1937,6 +1936,34 @@ class SdlcWorkflowService {
           fileRef = await this._writeArtifactToFile(task.projectId, task.id, `${artType}.${ext}`, content);
         } else {
           fileRef = await this._writeArtifactToFile(task.projectId, task.id, `${artType}.json`, content);
+        }
+
+        // Architecture stage only: mirror `architecture_contract` into the
+        // cloned repo at `.aifa/architecture_contract.json` so the
+        // auto-commit on approve (`repoService.commitAndPushOnApprove`) has
+        // something to `git add`. Workspace artifact remains authoritative
+        // for pipeline consumers. Best-effort: a missing repo workspace
+        // (early failure, before clone) is logged and skipped — the
+        // workspace artifact still exists.
+        if (artType === 'architecture_contract' && task.sessionId) {
+          try {
+            const repoService = require('./repoService');
+            const sessionRepo = await repoService.getSessionRepoInfo({
+              projectId: task.projectId,
+              sessionId: task.sessionId,
+            }).catch(() => null);
+            if (sessionRepo?.repoPath) {
+              const mirrorDir = path.join(sessionRepo.repoPath, '.aifa');
+              await fs.mkdir(mirrorDir, { recursive: true });
+              const mirrorPath = path.join(mirrorDir, 'architecture_contract.json');
+              const mirrorData = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+              await fs.writeFile(mirrorPath, mirrorData, 'utf8');
+            }
+          } catch (mirrorErr) {
+            logger.warn('architecture_contract mirror into repo failed (non-fatal)', {
+              taskId: task.id, error: mirrorErr.message,
+            });
+          }
         }
 
         artifactRows.push({
