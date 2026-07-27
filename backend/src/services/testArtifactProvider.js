@@ -124,13 +124,50 @@ async function getFakeAuditTrail(projectId /*, user, sessionId */) {
   };
 }
 
+// Test target — production code reads `remote.origin.url` from the local
+// repo's git config (releaseManager.js line 220) and pushes via that URL
+// using GH_TOKEN. We configure the local fixture repo so production pushes
+// to this exact target.
+const TEST_TARGET_REMOTE = 'https://github.com/namlee1998/test';
+
+async function bootstrapFixtureRepo(repoPath, baseBranch) {
+  const { execFileSync } = require('child_process');
+  const fs = require('fs');
+  fs.mkdirSync(repoPath, { recursive: true });
+  // Idempotent: only init when no .git exists.
+  if (!fs.existsSync(require('path').join(repoPath, '.git'))) {
+    execFileSync('git', ['init', '-q', '-b', baseBranch], { cwd: repoPath });
+    execFileSync('git', ['config', 'user.name', 'AIFA Test'], { cwd: repoPath });
+    execFileSync('git', ['config', 'user.email', 'test@aifa.io'], { cwd: repoPath });
+    execFileSync('git', ['config', 'remote.origin.url', TEST_TARGET_REMOTE], { cwd: repoPath });
+    execFileSync('git', ['commit', '--allow-empty', '-q', '-m', 'aifa: test fixture init'], { cwd: repoPath });
+  } else {
+    // Re-stamp origin in case previous fixture run set a different target.
+    try { execFileSync('git', ['config', 'remote.origin.url', TEST_TARGET_REMOTE], { cwd: repoPath }); } catch (_) {}
+  }
+}
+
 async function getFakeRepoContext(projectId, sessionId) {
+  // Mirror production path resolution: workspace/projects/<id>/sessions/<sid>/repo
+  const path = require('path');
+  const repoPath = path.join(
+    path.resolve(__dirname, '../../..'),
+    'workspace',
+    'projects',
+    projectId,
+    'sessions',
+    sessionId,
+    'repo',
+  );
+  await bootstrapFixtureRepo(repoPath, 'main');
+
   return {
     projectId,
     sessionId,
-    repoPath: null,
+    repoPath,
     workingBranch: 'test/final-gate',
     baseBranch: 'main',
+    repoUrl: TEST_TARGET_REMOTE,
     _testFixture: true,
   };
 }
