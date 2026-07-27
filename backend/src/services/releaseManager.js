@@ -22,16 +22,15 @@ async function submitReleaseDecision({
   sessionId, decisionId, decision, comment = '', user, deps = {},
 }) {
   // TEST_FINAL_GATE — human-approval bypass. When this env var is set:
-  //   - Skip decision/decisionId validation
-  //   - Skip the membership (project role) check
-  //   - Skip the HitlDecision.findByDecisionId idempotency lookup
-  //   - Skip the prior-release-decision lookup
-  //   - Skip HitlDecision.create — no human-approval record is persisted
-  // The post-approve production path (bundle build, commit, push, session
-  // flip, pipeline_completed event) is reached via the same `if (decision
-  // === 'APPROVE')` branch that production uses. We synthesize an in-memory
-  // `record` so the downstream code (workflowReport.writeReleaseBundle)
-  // reads a stable shape without a DB row.
+  //   - Force decision=APPROVE (no user input read).
+  //   - Skip HitlDecision.findByDecisionId idempotency lookup.
+  //   - Skip the prior-release-decision lookup.
+  //   - Skip HitlDecision.create — no human-approval record is persisted.
+  // Membership validation, repository logic, workflow logic, security checks,
+  // and the post-approve production path (bundle build, commit, push, session
+  // flip, pipeline_completed event) all run unchanged via the same code
+  // paths as production. We only inject a synthetic in-memory `record` so
+  // the downstream bundle code reads a stable shape without a DB row.
   let testAutoApproved = false;
   if (process.env.TEST_FINAL_GATE === 'true') {
     decision = 'APPROVE';
@@ -55,28 +54,28 @@ async function submitReleaseDecision({
     getUserProjectRole: async () => 'owner',
     createOwnerMembership: async () => {},
   };
-  const membership = testAutoApproved
-    ? { role: 'owner' }
-    : (user
-      ? await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer'])
-      : null);
+  const membership = user
+    ? await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer'])
+    : null;
   if (membership && !['owner', 'admin'].includes(membership.role)) {
     throw new ApiError(403, 'Only project owners and admins may approve or reject a release.');
   }
 
-  const existing = testAutoApproved ? null : await HitlDecision.findByDecisionId(decisionId);
-  if (existing && !testAutoApproved) return { hitlDecision: existing, idempotentReplay: true };
+  if (!testAutoApproved) {
+    const existing = await HitlDecision.findByDecisionId(decisionId);
+    if (existing) return { hitlDecision: existing, idempotentReplay: true };
+  }
 
   const qaTask = await Task.findLatestBySession(sessionId, 'qa-agent', 'completed', 'committed');
   if (!qaTask) throw new ApiError(409, 'Release gate is unavailable until QA is approved');
 
-  const priorReleaseDecision = testAutoApproved
-    ? null
-    : (await HitlDecision.findByProjectId(projectId))
+  if (!testAutoApproved) {
+    const priorReleaseDecision = (await HitlDecision.findByProjectId(projectId))
       .reverse()
       .find((record) => record.gate === FINAL_GATE && record.taskId === qaTask.id);
-  if (priorReleaseDecision && ['APPROVE', 'REJECT'].includes(priorReleaseDecision.decision) && !testAutoApproved) {
-    throw new ApiError(409, `This QA run was already finalized as ${priorReleaseDecision.decision}`);
+    if (priorReleaseDecision && ['APPROVE', 'REJECT'].includes(priorReleaseDecision.decision)) {
+      throw new ApiError(409, `This QA run was already finalized as ${priorReleaseDecision.decision}`);
+    }
   }
 
   const qaGatePass = qaGatePassed(qaTask);
