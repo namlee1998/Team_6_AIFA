@@ -79,8 +79,53 @@ async function getFakeRepoContext(projectId, sessionId) {
   };
 }
 
+// ── In-memory stand-ins for the two DB-touching side effects in the
+// post-approve path. Production code calls these via Prisma / eventBus
+// helpers; in TEST_MODE they hit a Map + in-memory subscriber set instead.
+// No real DB rows are created and no Sentry/BullMQ side effects fire.
+const fakeSessions = new Map();
+const fakeEventSubscribers = new Set();
+let fakeEventSequence = 0;
+
+async function fakePipelineSessionUpdate(sessionId, data) {
+  const prev = fakeSessions.get(sessionId) || { id: sessionId };
+  const next = { ...prev, ...data, _testFixture: true };
+  fakeSessions.set(sessionId, next);
+  return next;
+}
+
+async function fakePublishEvent(type, base, payload) {
+  if (!base || !base.projectId) throw new Error('publishEvent: base.projectId is required');
+  if (!base.sessionId) throw new Error('publishEvent: base.sessionId is required');
+  fakeEventSequence += 1;
+  const envelope = {
+    type, base, payload,
+    sequence: fakeEventSequence,
+    timestamp: new Date().toISOString(),
+    _testFixture: true,
+  };
+  for (const listener of fakeEventSubscribers) {
+    try { listener(envelope); } catch (_) { /* swallow */ }
+  }
+  return envelope;
+}
+
+// Test helpers — exposed only for assertions in scripts/tests.
+function _getFakeSession(sessionId) { return fakeSessions.get(sessionId) || null; }
+function _listFakeEvents() { return fakeEventSequence; }
+function _clearFakeState() {
+  fakeSessions.clear();
+  fakeEventSubscribers.clear();
+  fakeEventSequence = 0;
+}
+
 module.exports = {
   getFakeFinalReviewPacket,
   getFakeAuditTrail,
   getFakeRepoContext,
+  fakePipelineSessionUpdate,
+  fakePublishEvent,
+  _getFakeSession,
+  _listFakeEvents,
+  _clearFakeState,
 };
