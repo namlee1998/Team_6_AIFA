@@ -90,21 +90,19 @@ async function submitReleaseDecision({
     throw new ApiError(409, 'Release approval is blocked until all critical and high-risk evidence issues are resolved');
   }
 
-  // TEST_FINAL_GATE — synthetic escape hatch. When this env var is set, swap
-  // the deps (packet / audit / repoContext / DB writers / event publisher)
-  // for fake stand-ins produced by services/testArtifactProvider.js. The
-  // real `PipelineSession.update` (Prisma) and `publishEvent` (Prisma
-  // sequence + eventBus) are routed through deps so no real DB writes
-  // happen. Production behavior is otherwise untouched: same code path.
+  // TEST_FINAL_GATE — synthetic-artifact escape hatch. When this env var is
+  // set, swap the deps (packet / audit / repoContext) for fake stand-ins
+  // produced by services/testArtifactProvider.js. Production behavior is
+  // untouched: only the three deps below are replaced; the rest of the
+  // function (evidence, HITL record, commit/push, session flip, event)
+  // runs the same code path.
   if (process.env.TEST_FINAL_GATE === 'true') {
     // eslint-disable-next-line global-require
     const fakeProvider = require('./testArtifactProvider');
     deps = {
-      getFinalReviewPacket:    (sid, u) => fakeProvider.getFakeFinalReviewPacket(sid, u),
-      getAuditTrail:           (pid, u, sid) => fakeProvider.getFakeAuditTrail(pid, u, sid),
-      getRepoContext:          (pid, sid) => fakeProvider.getFakeRepoContext(pid, sid),
-      pipelineSessionUpdate:   (sid, data) => fakeProvider.fakePipelineSessionUpdate(sid, data),
-      publishEvent:            (type, base, payload) => fakeProvider.fakePublishEvent(type, base, payload),
+      getFinalReviewPacket: (sid, u) => fakeProvider.getFakeFinalReviewPacket(sid, u),
+      getAuditTrail:        (pid, u, sid) => fakeProvider.getFakeAuditTrail(pid, u, sid),
+      getRepoContext:       (pid, sid) => fakeProvider.getFakeRepoContext(pid, sid),
     };
   }
 
@@ -232,17 +230,12 @@ async function submitReleaseDecision({
       }
 
       // 5. Mark the session completed.
-      if (deps.pipelineSessionUpdate) {
-        await deps.pipelineSessionUpdate(sessionId, { status: 'completed', outputDir: bundle.outputDir });
-      } else {
-        await PipelineSession.update(sessionId, { status: 'completed', outputDir: bundle.outputDir });
-      }
+      await PipelineSession.update(sessionId, { status: 'completed', outputDir: bundle.outputDir });
 
       // 6. Emit pipeline_completed — the canonical terminal event. Only
       //    here, never at the QA commit boundary (that path was re-homed
       //    to FINAL_RELEASE gate creation in SdlcWorkflowService A.1).
-      const publish = deps.publishEvent || publishEvent;
-      await publish(
+      await publishEvent(
         'pipeline_completed',
         { projectId, sessionId, taskId: qaTask.id, role: 'release' },
         {
