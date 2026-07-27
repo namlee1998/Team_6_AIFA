@@ -68,6 +68,22 @@ async function submitReleaseDecision({
     throw new ApiError(409, 'Release approval is blocked until all critical and high-risk evidence issues are resolved');
   }
 
+  // TEST_FINAL_GATE — synthetic-artifact escape hatch. When this env var is
+  // set, swap the deps (packet / audit / repoContext) for fake stand-ins
+  // produced by services/testArtifactProvider.js. Production behavior is
+  // untouched: only the three deps below are replaced; the rest of the
+  // function (evidence, HITL record, commit/push, session flip, event)
+  // runs the same code path.
+  if (process.env.TEST_FINAL_GATE === 'true') {
+    // eslint-disable-next-line global-require
+    const fakeProvider = require('./testArtifactProvider');
+    deps = {
+      getFinalReviewPacket: (sid, u) => fakeProvider.getFakeFinalReviewPacket(sid, u),
+      getAuditTrail:        (pid, u, sid) => fakeProvider.getFakeAuditTrail(pid, u, sid),
+      getRepoContext:       (pid, sid) => fakeProvider.getFakeRepoContext(pid, sid),
+    };
+  }
+
   const releaseComment = comment || {
     APPROVE: 'Release approved by authorized reviewer',
     REJECT: 'Release rejected by authorized reviewer',
