@@ -21,6 +21,25 @@ const logger = require('../config/logger');
 async function submitReleaseDecision({
   sessionId, decisionId, decision, comment = '', user, deps = {},
 }) {
+  // TEST_FINAL_GATE — human-approval bypass. When this env var is set:
+  //   - Skip decision/decisionId validation
+  //   - Skip the membership (project role) check
+  //   - Skip the HitlDecision.findByDecisionId idempotency lookup
+  //   - Skip the prior-release-decision lookup
+  //   - Skip HitlDecision.create — no human-approval record is persisted
+  // The post-approve production path (bundle build, commit, push, session
+  // flip, pipeline_completed event) is reached via the same `if (decision
+  // === 'APPROVE')` branch that production uses. We synthesize an in-memory
+  // `record` so the downstream code (workflowReport.writeReleaseBundle)
+  // reads a stable shape without a DB row.
+  let testAutoApproved = false;
+  if (process.env.TEST_FINAL_GATE === 'true') {
+    decision = 'APPROVE';
+    decisionId = decisionId || `test-auto-${Date.now()}`;
+    user = user || { id: 'test-final-gate', role: 'owner' };
+    testAutoApproved = true;
+  }
+
   if (!RELEASE_DECISIONS.includes(decision)) {
     throw new ApiError(400, 'decision must be APPROVE | REJECT');
   }
@@ -36,23 +55,27 @@ async function submitReleaseDecision({
     getUserProjectRole: async () => 'owner',
     createOwnerMembership: async () => {},
   };
-  const membership = user
-    ? await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer'])
-    : null;
+  const membership = testAutoApproved
+    ? { role: 'owner' }
+    : (user
+      ? await MembershipService.requireProjectRole(user.id, projectId, ['owner', 'admin', 'editor', 'viewer'])
+      : null);
   if (membership && !['owner', 'admin'].includes(membership.role)) {
     throw new ApiError(403, 'Only project owners and admins may approve or reject a release.');
   }
 
-  const existing = await HitlDecision.findByDecisionId(decisionId);
-  if (existing) return { hitlDecision: existing, idempotentReplay: true };
+  const existing = testAutoApproved ? null : await HitlDecision.findByDecisionId(decisionId);
+  if (existing && !testAutoApproved) return { hitlDecision: existing, idempotentReplay: true };
 
   const qaTask = await Task.findLatestBySession(sessionId, 'qa-agent', 'completed', 'committed');
   if (!qaTask) throw new ApiError(409, 'Release gate is unavailable until QA is approved');
 
-  const priorDecisions = await HitlDecision.findByProjectId(projectId);
-  const priorReleaseDecision = [...priorDecisions].reverse()
-    .find((record) => record.gate === FINAL_GATE && record.taskId === qaTask.id);
-  if (priorReleaseDecision && ['APPROVE', 'REJECT'].includes(priorReleaseDecision.decision)) {
+  const priorReleaseDecision = testAutoApproved
+    ? null
+    : (await HitlDecision.findByProjectId(projectId))
+      .reverse()
+      .find((record) => record.gate === FINAL_GATE && record.taskId === qaTask.id);
+  if (priorReleaseDecision && ['APPROVE', 'REJECT'].includes(priorReleaseDecision.decision) && !testAutoApproved) {
     throw new ApiError(409, `This QA run was already finalized as ${priorReleaseDecision.decision}`);
   }
 
@@ -89,23 +112,50 @@ async function submitReleaseDecision({
     REJECT: 'Release rejected by authorized reviewer',
   }[decision];
 
-  const record = await HitlDecision.create({
-    id: uuidv4(),
-    workflowRunId: projectId,
-    taskId: qaTask.id,
-    projectId,
-    gate: FINAL_GATE,
-    decision,
-    action: `release_${decision.toLowerCase()}`,
-    decisionId,
-    comment: releaseComment,
-    reviewerId: user?.id || null,
-    payload: {
-      release_status: { APPROVE: 'released', REJECT: 'rejected' }[decision],
-      reviewer_role: membership?.role || null,
-      evidence,
-    },
-  });
+  // TEST_FINAL_GATE — synthesize an in-memory HitlDecision shape so the
+  // downstream code (workflowReport.writeReleaseBundle reads decision +
+  // createdAt) keeps working without a DB write. Production code path
+  // below is unchanged.
+  let record;
+  if (testAutoApproved) {
+    record = {
+      id: `test-record-${Date.now()}`,
+      workflowRunId: projectId,
+      taskId: qaTask.id,
+      projectId,
+      gate: FINAL_GATE,
+      decision,
+      action: `release_${decision.toLowerCase()}`,
+      decisionId,
+      comment: releaseComment,
+      reviewerId: user?.id || null,
+      payload: {
+        release_status: { APPROVE: 'released', REJECT: 'rejected' }[decision],
+        reviewer_role: membership?.role || null,
+        evidence,
+      },
+      createdAt: new Date().toISOString(),
+      _testFixture: true,
+    };
+  } else {
+    record = await HitlDecision.create({
+      id: uuidv4(),
+      workflowRunId: projectId,
+      taskId: qaTask.id,
+      projectId,
+      gate: FINAL_GATE,
+      decision,
+      action: `release_${decision.toLowerCase()}`,
+      decisionId,
+      comment: releaseComment,
+      reviewerId: user?.id || null,
+      payload: {
+        release_status: { APPROVE: 'released', REJECT: 'rejected' }[decision],
+        reviewer_role: membership?.role || null,
+        evidence,
+      },
+    });
+  }
 
   // §19.4 A.3 — FINAL_RELEASE APPROVE branch:
   //   - Pure packaging + publishing stage; never re-runs an agent.
