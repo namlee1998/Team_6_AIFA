@@ -176,29 +176,21 @@ async function submitReleaseDecision({
         deps.getRepoContext(projectId, sessionId),
       ]);
 
-      // 1. Remove previously-generated release artifacts (if any) for this
-      //    session. The bundle lives in sessions/<slug>-<shortId>/ inside
-      //    the canonical repo; findPreviousBundle confirms ownership via the
-      //    naming convention (and a .aifa-bundle-id marker when present) so
-      //    we never delete a different session's bundle.
+      // Spec §7.2 — repoPath is the single source of truth. The release
+      // bundle is now written directly into repoPath by writeReleaseBundle
+      // (workflowReport.js), so there's no separate `outputDir` to clean
+      // up here. Previous releases are tracked by git history.
       const repoPath = repoContext?.repoPath || repoService.repoPathFor(projectId, sessionId);
-      const canonicalRepoPath = repoService.repoPathFor(projectId);
-      const sessionsRoot = path.join(canonicalRepoPath, 'sessions');
-      const oldBundle = await workflowReport.findPreviousBundle(sessionsRoot, sessionId);
-      if (oldBundle) {
-        await workflowReport.removeGitTracked(repoPath, oldBundle.relativePath);
-        const fs = require('fs/promises');
-        await fs.rm(oldBundle.absolutePath, { recursive: true, force: true });
-      }
 
-      // 2. Write the new bundle. workflowReport.writeReleaseBundle now
-      //    includes audit-trail.json (added in §19 step 1).
+      // 1. Write the new bundle. workflowReport.writeReleaseBundle now
+      //    writes final.md + qa-report.md + audit-trail.json directly into
+      //    repoPath when available.
       const bundle = await workflowReport.writeReleaseBundle({
         projectId, session, repoContext, packet, audit, evidence, releaseDecision: record,
       });
       releaseOutputs = bundle.outputs;
 
-      // 3. Commit the bundle. The commit message is prefixed
+      // 2. Commit the bundle. The commit message is prefixed
       //    `[release][<shortId>]` so it's visually distinct from per-agent
       //    checkpoint commits written by commitAndPushOnApprove.
       if (repoPath) {
@@ -211,7 +203,7 @@ async function submitReleaseDecision({
           const shortId = String(sessionId).slice(0, 8);
           await git(['commit', '-m', `[release][${shortId}] aifa: publish final.md + qa-report.md + audit-trail.json`], repoPath);
 
-          // 4. Push is best-effort — commit is mandatory, push is not.
+          // 3. Push is best-effort — commit is mandatory, push is not.
           //    Mirrors commitAndPushOnApprove's semantics: failures are
           //    logged, never thrown.
           const token = process.env.GH_TOKEN;
@@ -229,10 +221,12 @@ async function submitReleaseDecision({
         }
       }
 
-      // 5. Mark the session completed.
+      // 4. Mark the session completed. `outputDir` is preserved on the row
+      //    for backward compatibility — the column is deprecated; the
+      //    release bundle now lives directly in repoPath.
       await PipelineSession.update(sessionId, { status: 'completed', outputDir: bundle.outputDir });
 
-      // 6. Emit pipeline_completed — the canonical terminal event. Only
+      // 5. Emit pipeline_completed — the canonical terminal event. Only
       //    here, never at the QA commit boundary (that path was re-homed
       //    to FINAL_RELEASE gate creation in SdlcWorkflowService A.1).
       await publishEvent(

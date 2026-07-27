@@ -158,40 +158,40 @@ async function writeReleaseBundle({ projectId, session, repoContext, packet, aud
     }
   }
 
-  const canonicalRepoPath = repoService.repoPathFor(projectId);
-  const slug = repoService.slugify(session?.title || 'session', 'session');
-  const shortId = String(session?.id || '').slice(0, 8) || Date.now().toString(36);
-  const outputDir = path.join(canonicalRepoPath, 'sessions', `${slug}-${shortId}`);
-  await fs.mkdir(outputDir, { recursive: true });
-
-  // Copy the session's working tree (its code changes) alongside the report,
-  // excluding git metadata — the canonical upload is left untouched.
+  // Spec §7.2: repoPath is the single source of truth. Final bundle lands
+  // directly inside the working tree so `releaseManager` can `git add -A`
+  // + commit + push without any cross-directory copy. When `repoPath` is
+  // unavailable (no clone yet), fall back to a legacy `outputDir` under
+  // `canonicalRepoPath/sessions/` to keep callers working in that edge case.
+  let outputDir;
+  let writeRoot;
   if (repoPath) {
-    try {
-      const entries = await fs.readdir(repoPath);
-      await Promise.all(entries
-        .filter((entry) => entry !== '.git')
-        .map((entry) => fs.cp(path.join(repoPath, entry), path.join(outputDir, entry), { recursive: true })));
-    } catch (e) {
-      logger.warn('release bundle: working tree copy failed', { projectId, error: e.message });
-    }
+    writeRoot = repoPath;
+    outputDir = repoPath;
+  } else {
+    const canonicalRepoPath = repoService.repoPathFor(projectId);
+    const slug = repoService.slugify(session?.title || 'session', 'session');
+    const shortId = String(session?.id || '').slice(0, 8) || Date.now().toString(36);
+    outputDir = path.join(canonicalRepoPath, 'sessions', `${slug}-${shortId}`);
+    await fs.mkdir(outputDir, { recursive: true });
+    writeRoot = outputDir;
   }
 
   const finalMd = buildFinalMarkdown({ projectId, session, repoContext, packet, audit, evidence, releaseDecision, diff });
-  const finalMdPath = path.join(outputDir, 'final.md');
+  const finalMdPath = path.join(writeRoot, 'final.md');
   await fs.writeFile(finalMdPath, finalMd, 'utf8');
 
   // QA report as its own file for convenience.
   const qaReport = joinedArtifacts(packet?.artifacts || [], 'qa-agent', ['qa_report', 'test_run_report', 'ac_coverage_matrix'])
     || '_No QA evidence_';
-  const qaPath = path.join(outputDir, 'qa-report.md');
+  const qaPath = path.join(writeRoot, 'qa-report.md');
   await fs.writeFile(qaPath, qaReport, 'utf8');
 
   // audit-trail.json — full audit timeline so consumers can replay/reconstruct
   // the session deterministically without hitting the database. The same
   // `audit` blob was already injected into final.md §8; persisting it as JSON
   // makes it machine-readable.
-  const auditPath = path.join(outputDir, 'audit-trail.json');
+  const auditPath = path.join(writeRoot, 'audit-trail.json');
   await fs.writeFile(auditPath, JSON.stringify(audit ?? {}, null, 2), 'utf8');
 
   const outputs = [

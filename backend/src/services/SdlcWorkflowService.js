@@ -57,6 +57,49 @@ const {
 } = workflowHelpers;
 const logger = require('../config/logger');
 
+// Canonical on-disk file names for each artifactType. Keeps the working
+// tree readable: `.aifa/architecture.md`, `.aifa/product-spec.md`,
+// `.aifa/patch.diff`, etc. — instead of `.aifa/<taskId>/<artifactType>.json`.
+// Unknown artifact types fall back to `${artType}.md` / `${artType}.json`.
+const REPO_ARTIFACT_FILE_NAMES = {
+  architecture_brief:        'architecture.md',
+  architecture_contract:     'architecture.md',
+  prd:                      'product-spec.md',
+  product_spec:             'product-spec.md',
+  user_stories:             'product-spec.md',
+  acceptance_criteria:      'product-spec.md',
+  scope:                    'product-spec.md',
+  out_of_scope:             'product-spec.md',
+  ux_spec:                  'ux-spec.md',
+  wireframe_spec:           'ux-spec.md',
+  user_flow:                'ux-spec.md',
+  screens:                  'ux-spec.md',
+  component_inventory:      'ux-spec.md',
+  html_mockup:              'ux-spec.html',
+  implementation_plan:      'plan.md',
+  linked_ac_ids:            'plan.md',
+  changed_files:            'plan.md',
+  patch_branch:             'plan.md',
+  patch_commit:             'plan.md',
+  patch_format:             'plan.md',
+  patch_diff:               'patch.diff',
+  risk_assessment:          'plan.md',
+  risk_level:               'plan.md',
+  mock_code_diff:           'patch.diff',
+  sandbox_report:           'patch.diff',
+  sandbox_result:           'patch.diff',
+  qa_report:                'qa-report.md',
+  test_run_report:          'qa-report.json',
+  test_cases:               'qa-report.json',
+  ac_coverage_matrix:       'qa-report.json',
+  regression_risks:         'qa-report.json',
+  security_findings:        'qa-report.json',
+  release_decision:         'qa-report.md',
+  release_recommendation:   'qa-report.md',
+  release_reason:           'qa-report.md',
+  mcp_activity:             'qa-report.json',
+};
+
 // ---------------------------------------------------------------------------
 // sdlcConstants: single source of truth for all workflow constants
 // ---------------------------------------------------------------------------
@@ -1643,6 +1686,29 @@ class SdlcWorkflowService {
     return artifactManager.writeArtifactToFile(projectId, taskId, filename, content);
   }
 
+  // Spec §7.2: repoPath is the single source of truth. After an agent
+  // finishes, its artifacts land INSIDE the cloned repo at `.aifa/`. The
+  // subsequent `commitAndPushOnApprove` then `git add -A` + commits them
+  // locally. This helper hides path / extension / mkdir / encoding
+  // concerns from `_saveAgentData`.
+  async _writeArtifactToRepo(task, artType, content) {
+    if (!task || !task.projectId || !task.sessionId) return null;
+    const repoInfo = await repoService.getSessionRepoInfo({
+      projectId: task.projectId,
+      sessionId: task.sessionId,
+    }).catch(() => null);
+    const repoPath = repoInfo?.repoPath;
+    if (!repoPath) return null;
+    const fileName = REPO_ARTIFACT_FILE_NAMES[artType]
+      || `${artType}.${content && typeof content === 'object' ? 'json' : 'md'}`;
+    const dir = path.join(repoPath, '.aifa');
+    await fs.mkdir(dir, { recursive: true });
+    const filePath = path.join(dir, fileName);
+    const data = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+    await fs.writeFile(filePath, data, 'utf8');
+    return filePath;
+  }
+
   /**
    * I4: the mock implementation of the agent contract `run({task, context}) ->
    * output`. Pure builder — reads mock-data, applies the role/scenario shaping,
@@ -1931,41 +1997,7 @@ class SdlcWorkflowService {
     for (const artType of artifactTypes) {
       if (completedData[artType] !== undefined && completedData[artType] !== null) {
         const content = completedData[artType];
-        let fileRef = null;
-        const ext = artType === 'html_mockup' ? 'html' : (typeof content === 'string' ? 'md' : 'json');
-
-        if (typeof content === 'string') {
-          fileRef = await this._writeArtifactToFile(task.projectId, task.id, `${artType}.${ext}`, content);
-        } else {
-          fileRef = await this._writeArtifactToFile(task.projectId, task.id, `${artType}.json`, content);
-        }
-
-        // Architecture stage only: mirror `architecture_contract` into the
-        // cloned repo at `.aifa/architecture_contract.json` so the
-        // auto-commit on approve (`repoService.commitAndPushOnApprove`) has
-        // something to `git add`. Workspace artifact remains authoritative
-        // for pipeline consumers. Best-effort: a missing repo workspace
-        // (early failure, before clone) is logged and skipped — the
-        // workspace artifact still exists.
-        if (artType === 'architecture_contract' && task.sessionId) {
-          try {
-            const sessionRepo = await repoService.getSessionRepoInfo({
-              projectId: task.projectId,
-              sessionId: task.sessionId,
-            }).catch(() => null);
-            if (sessionRepo?.repoPath) {
-              const mirrorDir = path.join(sessionRepo.repoPath, '.aifa');
-              await fs.mkdir(mirrorDir, { recursive: true });
-              const mirrorPath = path.join(mirrorDir, 'architecture_contract.json');
-              const mirrorData = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
-              await fs.writeFile(mirrorPath, mirrorData, 'utf8');
-            }
-          } catch (mirrorErr) {
-            logger.warn('architecture_contract mirror into repo failed (non-fatal)', {
-              taskId: task.id, error: mirrorErr.message,
-            });
-          }
-        }
+        const fileRef = await this._writeArtifactToRepo(task, artType, content);
 
         artifactRows.push({
           id: uuidv4(),
@@ -1976,7 +2008,7 @@ class SdlcWorkflowService {
           artifactKey: `${artType}:${task.id}`,
           title: artType.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
           contentText: typeof content === 'string' ? fileRef : null,
-          contentJson: typeof content === 'object' ? { file_path: fileRef.slice(5) } : null,
+          contentJson: typeof content === 'object' ? { file_path: fileRef || null } : null,
           ordinal: artifactTypes.indexOf(artType),
           contentHash: contentHash(content),
         });
@@ -1984,8 +2016,8 @@ class SdlcWorkflowService {
     }
 
     // PO owns one canonical agent-io bundle. Persist its five fields normally
-    // above, then mirror that same bundle as one repository artifact so the
-    // approval commit has exactly one PO-owned file to stage.
+    // above, then write that bundle as a single repo file so the approval
+    // commit has exactly one PO-owned file to stage.
     if (task.type === 'po-agent' && task.sessionId) {
       const productSpec = {
         prd: completedData.prd,
@@ -1994,25 +2026,7 @@ class SdlcWorkflowService {
         scope: completedData.scope,
         out_of_scope: completedData.out_of_scope,
       };
-      try {
-        const sessionRepo = await repoService.getSessionRepoInfo({
-          projectId: task.projectId,
-          sessionId: task.sessionId,
-        }).catch(() => null);
-        if (sessionRepo?.repoPath) {
-          const mirrorDir = path.join(sessionRepo.repoPath, '.aifa');
-          await fs.mkdir(mirrorDir, { recursive: true });
-          await fs.writeFile(
-            path.join(mirrorDir, 'product-spec.json'),
-            JSON.stringify(productSpec, null, 2),
-            'utf8',
-          );
-        }
-      } catch (mirrorErr) {
-        logger.warn('PO product-spec mirror into repo failed (non-fatal)', {
-          taskId: task.id, error: mirrorErr.message,
-        });
-      }
+      await this._writeArtifactToRepo(task, 'product_spec', productSpec);
     }
 
     if (artifactRows.length > 0) {

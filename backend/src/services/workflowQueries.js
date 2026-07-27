@@ -313,17 +313,28 @@ async function getReleaseFile(sessionId, fileName, user) {
   if (!['final.md', 'qa-report.md'].includes(fileName)) {
     throw new ApiError(400, 'Only final.md and qa-report.md can be downloaded');
   }
-  if (!session.outputDir) throw new ApiError(404, `${fileName} has not been generated yet`);
-  const filePath = path.join(session.outputDir, fileName);
-  if (!repoService.isWithinRepo(session.outputDir, fileName)) {
-    throw new ApiError(400, 'Invalid release file path');
-  }
-  try {
-    await fs.access(filePath);
-  } catch (_) {
+  // Spec §7.2 — release bundle now lives directly inside repoPath. Fall
+  // back to the legacy `outputDir` column when present so historical
+  // sessions continue to serve downloads.
+  const candidates = [];
+  if (session.outputDir) candidates.push(path.join(session.outputDir, fileName));
+  if (session.repoPath) candidates.push(path.join(session.repoPath, fileName));
+  if (candidates.length === 0) {
     throw new ApiError(404, `${fileName} has not been generated yet`);
   }
-  return filePath;
+  for (const filePath of candidates) {
+    try {
+      await fs.access(filePath);
+      if (session.outputDir && !repoService.isWithinRepo(session.outputDir, fileName)) {
+        throw new ApiError(400, 'Invalid release file path');
+      }
+      return filePath;
+    } catch (accessErr) {
+      if (accessErr instanceof ApiError) throw accessErr;
+      // try next candidate
+    }
+  }
+  throw new ApiError(404, `${fileName} has not been generated yet`);
 }
 
 async function getTaskEvents(taskId, { afterSequence = null, limit = 200 } = {}, user) {
