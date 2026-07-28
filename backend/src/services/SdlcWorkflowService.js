@@ -63,7 +63,7 @@ const logger = require('../config/logger');
 const {
   WORKSPACE_DIR, AGENT_GATES, OUTPUT_REVIEW_GATE_TYPE, CLARIFY_GATE_TYPE, NEXT_AGENT, NODE_TARGET,
   REWORK_TARGETS, GATE_MODE, DEFAULT_GATE_MODE, REVIEW_HOLDS, GATE_CONFIG,
-  AUTO_APPROVE_CONFIDENCE, OUTPUT_CONTRACT_VERSION, OUTPUT_CONTRACTS,
+  OUTPUT_CONTRACT_VERSION, OUTPUT_CONTRACTS,
   MAX_RETRY_PER_STEP, RETRY_REASONS, AGENT_POLICY, FINAL_GATE, RELEASE_DECISIONS,
   MOCK_REVIEW_STAGES, DEFAULT_MOCK_SCENARIO, VAGUE_REVIEW_COMMENTS,
   MOCK_SCENARIO_PROFILES,
@@ -1300,7 +1300,7 @@ class SdlcWorkflowService {
     if (qaTask?.result) {
       qaResult = {
         status: qaTask.result.gateRecommendation === 'PASS' ? 'passed' : 'failed',
-        coverage: qaTask.result.qa_report?.coverage || 100,
+        coverage: qaTask.result.coverage_summary?.percentage,
         blockers: qaTask.result.blocker_count || 0,
         warnings: 0,
         reportUrl: `/api/v1/sdlc/sessions/${sessionId}/release-files/qa-report.md`,
@@ -2077,10 +2077,7 @@ class SdlcWorkflowService {
     // in-place on resolve. There is exactly one canonical path; we no longer
     // create a question gate here, rerun the agent, or create a new task.
 
-    const persisted = await Task.findById(task.id);
-    const poAutoApprove = task.type === 'po-agent'
-      && persisted?.observability?.autoApproveOutputReview === true;
-    const resolvedGateMode = poAutoApprove ? GATE_MODE.AUTO_SAFE : this._resolveGateMode(task);
+    const resolvedGateMode = this._resolveGateMode(task);
 
     await Task.update(task.id, {
       status: 'completed',
@@ -2151,19 +2148,6 @@ class SdlcWorkflowService {
         approvalId,
         invalid: blockers.length > 0,
       });
-      if (poAutoApprove) {
-        await ready;
-        const approved = await this._autoApproveSafeOutput(task.id, userId, {
-          approvalId,
-          stopAfterAgent: persisted.observability?.stopAfterAgent || null,
-        });
-        if (!approved) {
-          logger.warn('PO happy-path auto approval did not pass the existing gate policy', {
-            taskId: task.id,
-            approvalId,
-          });
-        }
-      }
     }
 
     if (userId) {
@@ -2191,89 +2175,6 @@ class SdlcWorkflowService {
 
   _resolveGateMode(task) {
     return workflowHelpers.resolveGateMode(task);
-  }
-
-  async _autoApproveSafeOutput(taskId, userId = null, { approvalId = null, stopAfterAgent = null } = {}) {
-    const task = await Task.findById(taskId);
-    if (!task || task.gateMode === GATE_MODE.STRICT_MANUAL) return false;
-
-    const output = task.agentOutput || {};
-    const evaluation = this._evaluateGatePolicy(task);
-    if (evaluation.recommendation !== 'PASS') return false;
-    const { confidence, validation } = evaluation;
-
-    if (approvalId) {
-      const pending = gateBridge.getPending(approvalId);
-      if (!pending || pending.taskId !== task.id || pending.kind !== 'output_review') return false;
-      await gateBridge.resolveGate(approvalId, {
-        action: 'approve',
-        comment: 'Auto-approved by PO happy-path demo after validation passed',
-      });
-    }
-
-    await Task.update(task.id, { approvedOutput: output, version_status: 'committed' });
-    await Task.commitTask(task.id);
-    await AgentArtifact.setStatusByTaskId(task.id, 'VALID');
-    const commitResult = await repoService.commitAndPushOnApprove({
-      task,
-      onLog: (message, meta = {}) => {
-        publishEvent('runtime_log',
-          { projectId: task.projectId, sessionId: task.sessionId, taskId: task.id, role: null },
-          {
-            taskId: task.id,
-            level: meta.level || 'info',
-            source: 'auto_commit',
-            message,
-            meta,
-          },
-        );
-      },
-    });
-    const approval = await HitlDecision.create({
-      id: uuidv4(),
-      taskId: task.id,
-      projectId: task.projectId,
-      workflowRunId: task.projectId,
-      gate: AGENT_GATES[task.type],
-      decision: 'APPROVE',
-      action: 'auto_approve',
-      decisionId: uuidv4(),
-      baseOutputVersion: task.outputVersion || 0,
-      comment: `Auto-approved: confidence ${confidence.toFixed(2)}, validation passed`,
-      payload: {
-        approvalId,
-        confidence,
-        threshold: AUTO_APPROVE_CONFIDENCE,
-        validation,
-        commit: commitResult,
-        stopAfterAgent,
-      },
-    });
-    const refreshed = await Task.findById(task.id);
-    await Task.update(task.id, {
-      observability: {
-        ...(refreshed.observability || {}),
-        outputReviewApprovalId: approvalId,
-        autoApprovalId: approval.id,
-        commit: commitResult,
-      },
-    });
-    await this._recordApprovedHandoff(refreshed, approval);
-    if (stopAfterAgent !== refreshed.type) {
-      try {
-        await this._startNextAgentIfAvailable(refreshed, userId);
-      } catch (err) {
-        // A downstream startup failure must not turn an already completed and
-        // committed upstream task into FAILED.
-        logger.error('downstream agent failed to start after auto-approval', {
-          sourceTaskId: refreshed.id,
-          sourceAgent: refreshed.type,
-          nextAgent: this._nextAgentFor(refreshed),
-          error: err.message,
-        });
-      }
-    }
-    return true;
   }
 
   async _startNextAgentIfAvailable(task, userId = null) {

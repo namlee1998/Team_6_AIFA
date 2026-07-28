@@ -91,9 +91,6 @@ class SdlcController {
         sourceTaskId: source_task_id,
         featureRequest: feature_request,
         request: feature_request.title,
-        architectureInputPath: '.aifa/architecture_contract.json',
-        autoApproveOutputReview: true,
-        stopAfterAgent: 'po-agent',
         user: req.user,
       });
 
